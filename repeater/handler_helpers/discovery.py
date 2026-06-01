@@ -9,6 +9,7 @@ import asyncio
 import logging
 import secrets
 
+from pymc_core.node.handlers.anon_request import AnonRateLimiter
 from pymc_core.node.handlers.control import ControlHandler
 
 logger = logging.getLogger("DiscoveryHelper")
@@ -34,6 +35,10 @@ class DiscoveryHelper:
         log_fn=None,
         debug_log_fn=None,
         response_jitter_ms: int = DEFAULT_DISCOVERY_RESPONSE_JITTER_MS,
+        forwarding_enabled_fn=None,
+        mod_timestamp_fn=None,
+        rate_limit_max: int = 0,
+        rate_limit_secs: float = 120.0,
     ):
         """
         Initialize the discovery helper.
@@ -48,11 +53,36 @@ class DiscoveryHelper:
             response_jitter_ms: Upper bound (ms) for the randomized delay added before
                 transmitting a discovery response, to avoid multiple repeaters colliding
                 when answering the same broadcast. Set to 0 to disable (e.g. in tests).
+            forwarding_enabled_fn: Optional ``() -> bool`` returning whether this repeater is
+                currently forwarding. Mirrors firmware ``!_prefs.disable_fwd``: a non-forwarding
+                repeater (monitor / no_tx mode) does not answer discovery requests. Defaults to
+                always-enabled.
+            mod_timestamp_fn: Optional ``() -> int`` returning the unix timestamp of the last
+                discovery-relevant change for this node. Mirrors firmware
+                ``_prefs.discovery_mod_timestamp``: only reply when ``mod_timestamp >= since``.
+                When ``None`` the ``since`` filter is ignored and we always reply (the official
+                client sends ``since == 0`` anyway).
+            rate_limit_max: Max discovery replies per ``rate_limit_secs`` window. Firmware uses
+                ``discover_limiter(4, 120)``. **Disabled by default (0)** so the repeater answers
+                every discovery, matching this app's long-standing behaviour; rapid manual retries
+                would otherwise be silently dropped. Set > 0 to opt into firmware-style limiting.
+            rate_limit_secs: Window length (seconds) for ``rate_limit_max``. Firmware uses 120.
         """
         self.local_identity = local_identity
         self.packet_injector = packet_injector  # Function to inject packets into router
         self.node_type = node_type
         self.response_jitter_ms = max(0, int(response_jitter_ms))
+        self.forwarding_enabled_fn = forwarding_enabled_fn
+        self.mod_timestamp_fn = mod_timestamp_fn
+
+        # Optional rate limiter so a burst of discovery broadcasts can't make us a flood
+        # amplifier (firmware ``discover_limiter(4, 120)``). Off by default: enabling it can
+        # silently drop responses to legitimate repeated discovery, which surprised users.
+        self.discover_limiter = (
+            AnonRateLimiter(maximum=int(rate_limit_max), secs=float(rate_limit_secs))
+            if rate_limit_max and int(rate_limit_max) > 0
+            else None
+        )
 
         # Create ControlHandler internally as a parsing utility
         self.control_handler = ControlHandler(
@@ -92,16 +122,40 @@ class DiscoveryHelper:
             prefix_only = request_data.get("prefix_only", False)
             snr = request_data.get("snr", 0.0)
             rssi = request_data.get("rssi", 0)
+            since = request_data.get("since", 0)
 
             logger.info(
                 f"Request: tag=0x{tag:08X}, filter=0x{filter_byte:02X}, "
                 f"SNR={snr:+.1f}dB, RSSI={rssi}dBm"
             )
 
+            # Don't answer discovery while forwarding is disabled (monitor / no_tx mode).
+            # Mirrors firmware ``!_prefs.disable_fwd`` guard in onControlDataRecv.
+            if self.forwarding_enabled_fn is not None and not self.forwarding_enabled_fn():
+                logger.debug("Forwarding disabled, not answering discovery")
+                return
+
             # Check if filter matches our node type (repeater = 2, filter_mask = 0x04)
             filter_mask = 1 << self.node_type  # 1 << 2 = 0x04
             if (filter_byte & filter_mask) == 0:
                 logger.debug("Filter doesn't match, ignoring")
+                return
+
+            # Honor the request's ``since`` filter: firmware only replies when its
+            # discovery info changed at/after ``since`` (_prefs.discovery_mod_timestamp).
+            # With no mod-timestamp source we always reply (official client sends since=0).
+            if since and self.mod_timestamp_fn is not None:
+                mod_ts = int(self.mod_timestamp_fn())
+                if mod_ts < since:
+                    logger.debug(
+                        f"Discovery info unchanged since {since} (mod_ts={mod_ts}), ignoring"
+                    )
+                    return
+
+            # Optional rate limit (firmware discover_limiter); off by default so repeated
+            # discovery isn't silently dropped.
+            if self.discover_limiter is not None and not self.discover_limiter.allow():
+                logger.debug("Discovery rate limit reached, dropping response")
                 return
 
             logger.info("Sending response...")

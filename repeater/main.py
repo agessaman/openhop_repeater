@@ -258,6 +258,18 @@ class RepeaterDaemon:
                     node_type=2,
                     log_fn=logger.info,
                     debug_log_fn=logger.debug,
+                    # Only answer discovery while forwarding (firmware !disable_fwd):
+                    # monitor / no_tx modes are non-forwarding.
+                    forwarding_enabled_fn=(
+                        lambda: self.config.get("repeater", {}).get("mode", "forward") == "forward"
+                    ),
+                    # Discovery rate limit is opt-in (0 = off, the default). Firmware uses
+                    # (4, 120); set repeater.discovery_rate_limit to enable firmware-style
+                    # limiting without silently dropping legitimate repeated discovery.
+                    rate_limit_max=self.config.get("repeater", {}).get("discovery_rate_limit", 0),
+                    rate_limit_secs=self.config.get("repeater", {}).get(
+                        "discovery_rate_limit_secs", 120
+                    ),
                 )
                 logger.info("Discovery processing helper initialized")
             else:

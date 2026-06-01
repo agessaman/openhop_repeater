@@ -204,6 +204,101 @@ def test_discovery_request_without_identity_does_not_send():
     helper._send_discovery_response.assert_not_called()
 
 
+def test_discovery_no_reply_when_forwarding_disabled():
+    # Mirrors firmware !_prefs.disable_fwd: a non-forwarding repeater stays silent.
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+        node_type=2,
+        forwarding_enabled_fn=lambda: False,
+    )
+    helper._send_discovery_response = MagicMock()
+
+    helper._on_discovery_request(
+        {"tag": 9, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70}
+    )
+
+    helper._send_discovery_response.assert_not_called()
+
+
+def test_discovery_replies_when_forwarding_enabled():
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+        node_type=2,
+        forwarding_enabled_fn=lambda: True,
+    )
+    helper._send_discovery_response = MagicMock()
+
+    helper._on_discovery_request(
+        {"tag": 9, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70}
+    )
+
+    helper._send_discovery_response.assert_called_once()
+
+
+def test_discovery_not_rate_limited_by_default():
+    # Rate limiting is opt-in: by default the repeater answers every discovery.
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42), packet_injector=AsyncMock(), node_type=2
+    )
+    helper._send_discovery_response = MagicMock()
+
+    for i in range(6):
+        helper._on_discovery_request(
+            {"tag": i, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70}
+        )
+    assert helper._send_discovery_response.call_count == 6
+
+
+def test_discovery_rate_limited_when_enabled():
+    # With rate_limit_max=4 (firmware-style), the 5th reply in the window is dropped.
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+        node_type=2,
+        rate_limit_max=4,
+        rate_limit_secs=120,
+    )
+    helper._send_discovery_response = MagicMock()
+
+    for i in range(4):
+        helper._on_discovery_request(
+            {"tag": i, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70}
+        )
+    assert helper._send_discovery_response.call_count == 4
+
+    helper._on_discovery_request(
+        {"tag": 99, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70}
+    )
+    # Still 4: the rate limiter dropped the 5th.
+    assert helper._send_discovery_response.call_count == 4
+
+
+def test_discovery_since_filter_skips_when_info_unchanged():
+    # Mirrors firmware discovery_mod_timestamp >= since: if our info is older than the
+    # requested 'since', stay silent.
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+        node_type=2,
+        mod_timestamp_fn=lambda: 100,
+    )
+    helper._send_discovery_response = MagicMock()
+
+    # since newer than our mod timestamp -> no reply
+    helper._on_discovery_request(
+        {"tag": 1, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70, "since": 200}
+    )
+    helper._send_discovery_response.assert_not_called()
+
+    # since older than our mod timestamp -> reply
+    helper._on_discovery_request(
+        {"tag": 2, "filter": 0x04, "prefix_only": False, "snr": 1.0, "rssi": -70, "since": 50}
+    )
+    helper._send_discovery_response.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_discovery_send_packet_async_success_failure_and_exception():
     injector = AsyncMock(side_effect=[True, False, RuntimeError("send fail")])
