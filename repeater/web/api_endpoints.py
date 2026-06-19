@@ -1586,6 +1586,19 @@ class APIEndpoints:
             if self.event_loop is None:
                 return self._error("Event loop not available")
             import asyncio
+            import time as _t
+
+            _loop = self.event_loop
+            logger.info(
+                "ADVERT2: submit; loop running=%s closed=%s id=%s",
+                _loop.is_running(),
+                _loop.is_closed(),
+                id(_loop),
+            )
+            _pt0 = _t.monotonic()
+            _loop.call_soon_threadsafe(
+                lambda: logger.info("ADVERT2: loop probe ran after %.3fs", _t.monotonic() - _pt0)
+            )
 
             future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
             result = future.result(timeout=10)
