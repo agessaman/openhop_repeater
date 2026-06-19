@@ -69,7 +69,10 @@ class LogBuffer(logging.Handler):
             }
 
             if record.exc_info:
-                entry["exception"] = self.formatException(record.exc_info)
+                # formatException lives on Formatter, not Handler; use this handler's
+                # formatter (falling back to a default) so exc_info logs don't crash emit().
+                formatter = self.formatter or logging.Formatter()
+                entry["exception"] = formatter.formatException(record.exc_info)
 
             with self._lock:
                 self.logs.append(entry)
