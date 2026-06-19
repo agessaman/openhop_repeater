@@ -1139,6 +1139,10 @@ class RepeaterDaemon:
             return False
 
         try:
+            import asyncio as _asyncio
+            import time as _time
+            _t0 = _time.monotonic()
+            logger.info("ADVERT-DBG: start")
             from pymc_core.protocol import PacketBuilder
             from pymc_core.protocol.constants import ADVERT_FLAG_HAS_NAME, ADVERT_FLAG_IS_REPEATER
 
@@ -1155,6 +1159,12 @@ class RepeaterDaemon:
                 longitude = location.get("longitude", longitude)
                 location_source = str(location.get("source", location_source))
 
+            logger.info(
+                "ADVERT-DBG: location ready (%.3fs, source=%s)",
+                _time.monotonic() - _t0,
+                location_source,
+            )
+
             flags = ADVERT_FLAG_IS_REPEATER | ADVERT_FLAG_HAS_NAME
 
             packet = PacketBuilder.create_advert(
@@ -1169,7 +1179,18 @@ class RepeaterDaemon:
             )
 
             # Send via dispatcher
-            await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            logger.info("ADVERT-DBG: packet built (%.3fs), calling send_packet", _time.monotonic() - _t0)
+            try:
+                await _asyncio.wait_for(
+                    self.dispatcher.send_packet(packet, wait_for_ack=False), timeout=8
+                )
+            except _asyncio.TimeoutError:
+                logger.error(
+                    "ADVERT-DBG: send_packet did NOT return within 8s (%.3fs elapsed)",
+                    _time.monotonic() - _t0,
+                )
+                raise
+            logger.info("ADVERT-DBG: send_packet returned (%.3fs)", _time.monotonic() - _t0)
 
             if self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)
