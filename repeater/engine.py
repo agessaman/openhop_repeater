@@ -7,13 +7,17 @@ from collections import OrderedDict, deque
 from typing import Optional, Tuple
 
 from pymc_core.node.handlers.base import BaseHandler
-from pymc_core.protocol import Packet
+from pymc_core.protocol import Packet, PacketBuilder
 from pymc_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
+    PH_TYPE_MASK,
+    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
@@ -102,6 +106,10 @@ class RepeaterHandler(BaseHandler):
             )
         else:
             raise RuntimeError("Radio object not available - cannot initialize repeater")
+
+        # Strong references to fire-and-forget extra multi-ack TX tasks, so they are not
+        # garbage-collected before they run (see asyncio.create_task docs).
+        self._extra_ack_tasks: set = set()
 
         # Statistics tracking for dashboard
         self.rx_count = 0
@@ -373,6 +381,19 @@ class RepeaterHandler(BaseHandler):
                 )
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Packet not forwarded: {drop_reason}")
+
+        # Faithful multi-ack: emit extra multi-ack copies alongside a forwarded direct ACK
+        # (firmware routeDirectRecvAcks). Only for relayed ACKs; gated on the multi_acks pref.
+        if (
+            result
+            and transmitted
+            and not local_transmission
+            and fwd_pkt.get_payload_type() == PAYLOAD_TYPE_ACK
+        ):
+            try:
+                await self._schedule_extra_multi_acks(fwd_pkt, snr)
+            except Exception as exc:
+                logger.debug(f"Failed to schedule extra multi-acks: {exc}")
 
         # Extract packet type and route from header
         if not hasattr(packet, "header") or packet.header is None:
@@ -977,6 +998,73 @@ class RepeaterHandler(BaseHandler):
 
         return packet
 
+    def _extra_ack_transmit_count(self) -> int:
+        """Repeater equivalent of firmware getExtraAckTransmitCount() (the multi_acks pref).
+
+        Returns the number of extra multi-ack copies to emit when forwarding a direct ACK.
+        Firmware constrains this to 0..1; we clamp to the same range.
+        """
+        try:
+            value = int(self.config.get("repeater", {}).get("multi_acks", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(1, value))
+
+    @staticmethod
+    def _unwrap_multipart_ack(packet: Packet) -> bool:
+        """Convert a MULTIPART ACK packet in place into the embedded plain ACK.
+
+        Mirrors firmware Mesh::forwardMultipartDirect: the one-byte wrapper
+        ``(remaining << 4) | inner_type`` is stripped and the header's payload type is
+        rewritten to PAYLOAD_TYPE_ACK, so the repeater forwards a clean ACK rather than
+        relaying the raw multipart envelope. Returns True if the packet was an ACK
+        multipart and was transformed, False otherwise (caller leaves it untouched).
+        """
+        payload = packet.payload
+        # wrapper byte (1) + at least a 4-byte ACK CRC
+        if not payload or len(payload) < 5:
+            return False
+        if (payload[0] & 0x0F) != PAYLOAD_TYPE_ACK:
+            return False
+        packet.payload = bytearray(payload[1:])
+        packet.payload_len = len(packet.payload)
+        packet.header = (packet.header & ~(PH_TYPE_MASK << PH_TYPE_SHIFT)) | (
+            PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT
+        )
+        return True
+
+    async def _schedule_extra_multi_acks(self, fwd_pkt: Packet, snr: float) -> None:
+        """Emit extra multi-ack copies alongside a forwarded direct ACK.
+
+        Mirrors firmware Mesh::routeDirectRecvAcks: when ``multi_acks`` is enabled the
+        repeater emits N additional MULTIPART ACK copies (remaining=N..1) along the same
+        path as the forwarded ACK, so downstream hops can extract the embedded ACK early.
+        The plain ACK itself is forwarded through the normal pipeline; these copies are
+        purely additive. Scheduling uses the repeater's own TX-delay / duty-cycle model
+        rather than the firmware's fixed delays.
+        """
+        extra = self._extra_ack_transmit_count()
+        if extra <= 0:
+            return
+
+        ack_bytes = bytes(fwd_pkt.payload[: fwd_pkt.payload_len])
+        path = bytes(fwd_pkt.path or b"")
+        path_len_encoded = fwd_pkt.path_len if path else None
+        route_bits = fwd_pkt.header & PH_ROUTE_MASK
+
+        for remaining in range(extra, 0, -1):
+            mpkt = PacketBuilder.create_multi_ack(
+                ack_bytes, remaining=remaining, path=path, path_len_encoded=path_len_encoded
+            )
+            # Preserve the forwarded ACK's route type (DIRECT vs TRANSPORT_DIRECT).
+            mpkt.header = (mpkt.header & ~PH_ROUTE_MASK) | route_bits
+            delay = self._calculate_tx_delay(mpkt, snr)
+            airtime_ms = self.airtime_mgr.calculate_airtime(mpkt.get_raw_length())
+            # Fire-and-forget: keep a strong reference until the task completes.
+            task = await self.schedule_retransmit(mpkt, delay, airtime_ms)
+            self._extra_ack_tasks.add(task)
+            task.add_done_callback(self._extra_ack_tasks.discard)
+
     def direct_forward(self, packet: Packet, packet_hash: Optional[str] = None) -> Optional[Packet]:
         """Forward a DIRECT packet, removing the first hop from the path.
 
@@ -1009,12 +1097,23 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = "Direct: not for us"
             return None
 
+        # MULTIPART ACK: unwrap to the embedded plain ACK before forwarding (mirrors
+        # firmware forwardMultipartDirect). The transform changes the payload type and
+        # payload, so the pre-computed hash no longer applies — dedup on the transformed
+        # packet (matching the firmware's hasSeen(&tmp) on the stripped inner ACK).
+        dedup_hash = packet_hash
+        if packet.get_payload_type() == PAYLOAD_TYPE_MULTIPART:
+            if not self._unwrap_multipart_ack(packet):
+                packet.drop_reason = "Multipart: unsupported inner type"
+                return None
+            dedup_hash = None
+
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
-        if self.is_duplicate(packet, packet_hash=packet_hash):
+        if self.is_duplicate(packet, packet_hash=dedup_hash):
             packet.drop_reason = "Duplicate"
             return None
 
-        self.mark_seen(packet, packet_hash=packet_hash)
+        self.mark_seen(packet, packet_hash=dedup_hash)
 
         # Remove first hash entry (hash_size bytes)
         packet.path = bytearray(packet.path[hash_size:])

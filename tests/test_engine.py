@@ -15,6 +15,8 @@ import pytest
 from pymc_core.protocol import Packet, PacketBuilder
 from pymc_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
+    PAYLOAD_TYPE_MULTIPART,
     PH_ROUTE_MASK,
     PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
@@ -1656,7 +1658,11 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert sent_pkt.path[-1] == LOCAL_HASH
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    # MULTIPART (0x0A) is excluded: on direct routes it is now unwrapped to its embedded
+    # ACK rather than relayed unchanged (see TestMultipartAckForwarding).
+    @pytest.mark.parametrize(
+        "payload_type", [t for t in range(16) if t != PAYLOAD_TYPE_MULTIPART]
+    )
     async def test_all_payload_types_direct_injection_forwards(self, handler, payload_type):
         self._prepare_fast_tx(handler)
         pkt = _inject_from_wire(
@@ -1704,7 +1710,11 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert sent_pkt.transport_codes == [0x1111, 0x2222]
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    # MULTIPART (0x0A) is excluded: on direct routes it is now unwrapped to its embedded
+    # ACK rather than relayed unchanged (see TestMultipartAckForwarding).
+    @pytest.mark.parametrize(
+        "payload_type", [t for t in range(16) if t != PAYLOAD_TYPE_MULTIPART]
+    )
     async def test_all_payload_types_transport_direct_injection_forwards(
         self, handler, payload_type
     ):
@@ -1729,6 +1739,114 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert bytes(sent_pkt.path) == b"\x22"
         assert sent_pkt.transport_codes == [0x3333, 0x4444]
+
+
+@pytest.mark.asyncio
+class TestMultipartAckForwarding:
+    """Faithful multi-ack forwarding (firmware forwardMultipartDirect / routeDirectRecvAcks)."""
+
+    @staticmethod
+    def _prepare_fast_tx(handler):
+        handler.airtime_mgr.calculate_airtime = MagicMock(return_value=20.0)
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(True, 0.0))
+        handler.airtime_mgr.record_tx = MagicMock()
+        handler.airtime_mgr.record_rx = MagicMock()
+
+    async def test_direct_multipart_ack_unwrapped_to_ack(self, handler):
+        """A direct MULTIPART ACK is unwrapped to its embedded plain ACK before forwarding."""
+        self._prepare_fast_tx(handler)
+        crc = b"\x78\x56\x34\x12"
+        payload = bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + crc
+        pkt = _inject_from_wire(
+            _make_direct_packet(
+                payload=payload,
+                path=bytes([LOCAL_HASH, 0x44, 0x55]),
+                payload_type=PAYLOAD_TYPE_MULTIPART,
+            )
+        )
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(pkt, {"snr": 2.5, "rssi": -84}, local_transmission=False)
+
+        assert handler.dispatcher.send_packet.call_count == 1
+        sent = handler.dispatcher.send_packet.call_args.args[0]
+        assert sent.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert bytes(sent.payload[: sent.payload_len]) == crc  # wrapper byte stripped
+        assert bytes(sent.path) == b"\x44\x55"  # self removed from path
+
+    async def test_direct_multipart_non_ack_dropped(self, handler):
+        """A direct MULTIPART whose inner type is not an ACK is not forwarded."""
+        self._prepare_fast_tx(handler)
+        payload = bytes([(1 << 4) | 0x02]) + b"\x78\x56\x34\x12"  # inner type 0x02
+        pkt = _inject_from_wire(
+            _make_direct_packet(
+                payload=payload,
+                path=bytes([LOCAL_HASH, 0x44]),
+                payload_type=PAYLOAD_TYPE_MULTIPART,
+            )
+        )
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(pkt, {"snr": 2.5, "rssi": -84}, local_transmission=False)
+
+        assert handler.dispatcher.send_packet.call_count == 0
+
+    async def test_direct_ack_emits_extra_multi_ack_when_enabled(self, handler):
+        """With multi_acks enabled, forwarding a direct ACK also emits a multi-ack copy."""
+        self._prepare_fast_tx(handler)
+        handler.config["repeater"]["multi_acks"] = 1
+        crc = b"\x78\x56\x34\x12"
+        pkt = _inject_from_wire(
+            _make_direct_packet(
+                payload=crc, path=bytes([LOCAL_HASH, 0x44]), payload_type=PAYLOAD_TYPE_ACK
+            )
+        )
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(pkt, {"snr": 2.5, "rssi": -84}, local_transmission=False)
+            # Drain the fire-and-forget extra multi-ack task(s) deterministically.
+            await asyncio.gather(*list(handler._extra_ack_tasks))
+
+        types = sorted(
+            c.args[0].get_payload_type() for c in handler.dispatcher.send_packet.call_args_list
+        )
+        assert types == [PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_MULTIPART]
+        multi = next(
+            c.args[0]
+            for c in handler.dispatcher.send_packet.call_args_list
+            if c.args[0].get_payload_type() == PAYLOAD_TYPE_MULTIPART
+        )
+        assert (multi.payload[0] & 0x0F) == PAYLOAD_TYPE_ACK
+        assert bytes(multi.payload[1:5]) == crc  # same embedded CRC
+        assert bytes(multi.path) == b"\x44"  # forwarded along the stripped path
+
+    async def test_direct_ack_no_extra_when_disabled(self, handler):
+        """With multi_acks off (default), forwarding a direct ACK emits only the ACK."""
+        self._prepare_fast_tx(handler)
+        crc = b"\x78\x56\x34\x12"
+        pkt = _inject_from_wire(
+            _make_direct_packet(
+                payload=crc, path=bytes([LOCAL_HASH, 0x44]), payload_type=PAYLOAD_TYPE_ACK
+            )
+        )
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(pkt, {"snr": 2.5, "rssi": -84}, local_transmission=False)
+            await asyncio.gather(*list(handler._extra_ack_tasks))
+
+        assert handler.dispatcher.send_packet.call_count == 1
+        assert (
+            handler.dispatcher.send_packet.call_args.args[0].get_payload_type()
+            == PAYLOAD_TYPE_ACK
+        )
 
 
 # ===================================================================
