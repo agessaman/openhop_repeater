@@ -361,6 +361,10 @@ identities:
     #     tcp_port: 5000
     #     bind_address: "0.0.0.0"
     #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
+    #     tcp_handshake_timeout: 10  # seconds a new connection has to send its first
+    #                                # valid frame byte before it is dropped; a connection
+    #                                # that sends HTTP/garbage (browser, probe) is rejected
+    #                                # without evicting the active client. Default 10.
     # - name: "BotCompanion"
     #   identity_key: "another_companion_identity_key_hex"
     #   settings:

@@ -34,6 +34,7 @@ class CompanionFrameServer(_BaseFrameServer):
         port: int = 5000,
         bind_address: str = "0.0.0.0",  # nosec B104 - intentional default for LAN reachability
         client_idle_timeout_sec: Optional[int] = 8 * 60 * 60,  # 8 hours
+        handshake_timeout_sec: Optional[float] = 10.0,
         sqlite_handler=None,
         local_hash: Optional[int] = None,
         stats_getter=None,
@@ -45,6 +46,7 @@ class CompanionFrameServer(_BaseFrameServer):
             port=port,
             bind_address=bind_address,
             client_idle_timeout_sec=client_idle_timeout_sec,
+            handshake_timeout_sec=handshake_timeout_sec,
             device_model="pyMC-Repeater-Companion",
             device_version=None,  # use FIRMWARE_VER_CODE from pyMC_core
             build_date="13 Feb 2026",

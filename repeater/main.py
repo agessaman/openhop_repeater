@@ -556,6 +556,10 @@ class RepeaterDaemon:
                 bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
                 tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60)  # 8 hours
                 client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
+                # Probation window: a new connection must send its first valid frame
+                # byte within this many seconds or it is dropped without evicting the
+                # active client (blocks HTTP probes from kicking off the real app).
+                handshake_timeout = settings.get("tcp_handshake_timeout", 10)
 
                 def _make_sync_node_name_to_config(companion_name: str):
                     """Return a callback that syncs node_name to config for this companion (binds name at creation)."""
@@ -682,6 +686,7 @@ class RepeaterDaemon:
                     port=tcp_port,
                     bind_address=bind_address,
                     client_idle_timeout_sec=client_idle_timeout_sec,
+                    handshake_timeout_sec=handshake_timeout,
                     sqlite_handler=sqlite_handler,
                     local_hash=self.local_hash,
                     stats_getter=self._get_companion_stats,
@@ -772,6 +777,9 @@ class RepeaterDaemon:
         bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
         tcp_timeout_raw = settings.get("tcp_timeout", 120)
         client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
+        # Probation window: new connections must send a valid frame byte within this
+        # many seconds or they are dropped without evicting the active client.
+        handshake_timeout = settings.get("tcp_handshake_timeout", 10)
 
         bridge_kwargs = parse_companion_bridge_kwargs(settings)
         max_contacts = effective_max_contacts(bridge_kwargs)
@@ -865,6 +873,7 @@ class RepeaterDaemon:
             port=tcp_port,
             bind_address=bind_address,
             client_idle_timeout_sec=client_idle_timeout_sec,
+            handshake_timeout_sec=handshake_timeout,
             sqlite_handler=sqlite_handler,
             local_hash=self.local_hash,
             stats_getter=self._get_companion_stats,
