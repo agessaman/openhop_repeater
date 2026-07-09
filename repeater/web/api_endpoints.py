@@ -5445,6 +5445,7 @@ class APIEndpoints:
 
             mesh_config = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
             default_region = mesh_config.get("default_region")
+            repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
             packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=identity,
                 node_name=node_name,
@@ -5453,6 +5454,7 @@ class APIEndpoints:
                 flags=flags,
                 default_region=default_region,
                 scope_label="room server advert",
+                storage=getattr(repeater_handler, "storage", None),
             )
 
             # Send via dispatcher

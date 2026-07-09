@@ -1253,6 +1253,7 @@ class RepeaterDaemon:
                 flags=flags,
                 default_region=default_region,
                 scope_label="advert",
+                storage=self.repeater_handler.storage if self.repeater_handler else None,
             )
 
             # Send via dispatcher
