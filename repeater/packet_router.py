@@ -466,8 +466,32 @@ class PacketRouter:
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
             # Also feed adverts to companion bridges (for contact/path updates),
             # but keep policy drop final just like the other companion paths.
+            #
+            # Never deliver a companion its own advert. The shared dispatcher's
+            # hash-based self-filter is disabled here (main.py, _is_own_packet =
+            # lambda: False) so the repeater can forward all traffic, and it could
+            # not represent multiple companion identities anyway. Without this
+            # guard a companion that hears its own advert — re-delivered from its
+            # own injected TX, or reflooded over the air by a neighbor — would run
+            # the advert pipeline and auto-add *itself* to its own contacts (#346).
+            # The advert payload is pubkey(32) || timestamp(4) || signature(64) ||
+            # appdata, so payload[:32] is the sender pubkey (mirrors _is_own_packet
+            # treating payload[0] as the sender hash). Compare the full key, not the
+            # 1-byte hash, to avoid collisions between companions.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+            adv_pubkey = (
+                bytes(packet.payload[:32])
+                if packet.payload and len(packet.payload) >= 32
+                else None
+            )
             for bridge in companion_bridges.values():
+                if adv_pubkey is not None:
+                    try:
+                        if bridge.get_public_key() == adv_pubkey:
+                            logger.debug("Skipping own advert delivery to companion bridge")
+                            continue
+                    except Exception:
+                        pass
                 try:
                     await bridge.process_received_packet(packet)
                 except Exception as e:

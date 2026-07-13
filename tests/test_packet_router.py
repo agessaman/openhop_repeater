@@ -282,6 +282,37 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
         bridge.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
 
+    async def test_advert_not_delivered_to_originating_companion(self):
+        """A companion must not receive its own advert (would self-add to contacts, #346)."""
+        daemon = _make_daemon()
+        own_pubkey = bytes([0xAB]) + b"\x11" * 31
+        bridge = _make_bridge()
+        bridge.get_public_key = MagicMock(return_value=own_pubkey)
+        daemon.companion_bridges = {0xAB: bridge}
+        router = PacketRouter(daemon)
+
+        pkt = _make_packet(AdvertHandler.payload_type())
+        pkt.payload = own_pubkey + b"\x00" * 68  # pubkey(32) + timestamp(4) + sig(64)
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_not_awaited()
+
+    async def test_advert_delivered_to_other_companions(self):
+        """A companion still receives adverts from other nodes."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.get_public_key = MagicMock(return_value=bytes([0xAB]) + b"\x11" * 31)
+        daemon.companion_bridges = {0xAB: bridge}
+        router = PacketRouter(daemon)
+
+        pkt = _make_packet(AdvertHandler.payload_type())
+        pkt.payload = (bytes([0xCD]) + b"\x22" * 31) + b"\x00" * 68  # different sender
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once()
+
     async def test_non_injected_handler_false_is_logged(self):
         """Inbound packets should log when repeater_handler reports TX failure."""
         daemon = _make_daemon()
