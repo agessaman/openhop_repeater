@@ -20,10 +20,12 @@ from repeater.companion.identity_resolve import (
 )
 from repeater.companion.utils import (
     CompanionContactCapacityError,
+    companion_hash_str_from_identity_key,
     merge_companion_settings_update,
     parse_companion_bridge_kwargs,
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
+    validate_companion_node_name,
 )
 from repeater.config import resolve_storage_dir
 from repeater.policy_engine import PolicyEngine
@@ -334,6 +336,76 @@ class APIEndpoints:
             return None
 
         return text
+
+    def _apply_companion_node_name_live(
+        self, identity_key, node_name: str, resolved_name: str
+    ) -> bool:
+        """Apply a companion's advertised node_name to the running bridge and SQLite.
+
+        Returns True when a live bridge was updated (name is in effect now). When
+        no live bridge is loaded, the name is still written to the companion's
+        SQLite prefs so it survives the next restart — config node_name alone is
+        overridden by ``_load_prefs`` on boot — and this returns False.
+        """
+        try:
+            companion_hash_str = companion_hash_str_from_identity_key(identity_key)
+        except (ValueError, TypeError) as e:
+            logger.warning("Cannot derive companion hash for '%s': %s", resolved_name, e)
+            return False
+
+        bridges = (
+            (getattr(self.daemon_instance, "companion_bridges", None) or {})
+            if self.daemon_instance
+            else {}
+        )
+        bridge = bridges.get(int(companion_hash_str, 16))
+        if bridge is not None and hasattr(bridge, "set_advert_name"):
+            try:
+                bridge.set_advert_name(node_name)
+                logger.info(
+                    "Applied node_name '%s' to live companion '%s' (%s)",
+                    node_name,
+                    resolved_name,
+                    companion_hash_str,
+                )
+                return True
+            except Exception as e:
+                logger.warning(
+                    "Failed to apply node_name to live companion '%s': %s",
+                    resolved_name,
+                    e,
+                )
+
+        # No live bridge (or the live apply failed): persist to SQLite so the
+        # change is not reverted on the next restart by _load_prefs overriding
+        # the config node_name with the stale persisted value.
+        sqlite_handler = None
+        repeater_handler = (
+            getattr(self.daemon_instance, "repeater_handler", None)
+            if self.daemon_instance
+            else None
+        )
+        if repeater_handler and getattr(repeater_handler, "storage", None):
+            sqlite_handler = getattr(repeater_handler.storage, "sqlite_handler", None)
+        if sqlite_handler is not None:
+            try:
+                stored = sqlite_handler.companion_load_prefs(companion_hash_str) or {}
+                stored["node_name"] = node_name
+                sqlite_handler.companion_save_prefs(companion_hash_str, stored)
+                logger.info(
+                    "Persisted node_name '%s' to SQLite for companion '%s' (%s); "
+                    "applies on next restart",
+                    node_name,
+                    resolved_name,
+                    companion_hash_str,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to persist node_name to SQLite for companion '%s': %s",
+                    resolved_name,
+                    e,
+                )
+        return False
 
     def _enrich_discovery_result(self, result: dict) -> dict:
         enriched = dict(result)
@@ -5519,6 +5591,9 @@ class APIEndpoints:
                             pass
 
                 trimmed_count = 0
+                node_name_applied_live = False
+                prev_node_name = str((identity.get("settings") or {}).get("node_name") or "").strip()
+                new_node_name = prev_node_name
                 if "settings" in data:
                     try:
                         merged_settings = merge_companion_settings_update(
@@ -5527,6 +5602,18 @@ class APIEndpoints:
                         )
                     except ValueError as e:
                         return self._error(str(e))
+
+                    # node_name is stored raw by the merge; validate it here (the
+                    # only entry point that does) before it is persisted or applied
+                    # to a live bridge.
+                    if "node_name" in (data.get("settings") or {}):
+                        try:
+                            new_node_name = validate_companion_node_name(
+                                merged_settings.get("node_name")
+                            )
+                        except ValueError as e:
+                            return self._error(str(e))
+                        merged_settings["node_name"] = new_node_name
 
                     sqlite_handler = None
                     repeater_handler = (
@@ -5575,16 +5662,37 @@ class APIEndpoints:
                 if not saved:
                     return self._error("Failed to save configuration to file")
                 logger.info(f"Updated companion: {resolved_name}")
-                message = (
-                    f"Companion '{resolved_name}' updated successfully. "
-                    "Restart required to apply changes."
-                )
-                if trimmed_count:
-                    message = (
-                        f"Companion '{resolved_name}' updated successfully; "
-                        f"trimmed {trimmed_count} contact(s) to fit the new limit. "
-                        "Restart required to apply changes."
+
+                # Apply an advertised-name change to the running companion so it
+                # reaches the node immediately instead of only after a restart.
+                # This is essential, not just a nicety: on restart the bridge loads
+                # its SQLite-persisted prefs *over* the config node_name
+                # (companion_base._load_prefs), so a config-only change is silently
+                # reverted on next boot. set_advert_name updates the live prefs,
+                # re-persists them to SQLite, and syncs the name back to config —
+                # matching the MeshCore-app path and fixing the "name didn't show
+                # on the node" report (#346 follow-up).
+                if new_node_name != prev_node_name and identity.get("identity_key"):
+                    node_name_applied_live = self._apply_companion_node_name_live(
+                        identity["identity_key"], new_node_name, resolved_name
                     )
+
+                base = f"Companion '{resolved_name}' updated successfully."
+                parts = []
+                if node_name_applied_live:
+                    parts.append("Name applied immediately.")
+                if trimmed_count:
+                    parts.append(f"Trimmed {trimmed_count} contact(s) to fit the new limit.")
+                restart_needed = (
+                    ("new_name" in data)
+                    or bool(data.get("identity_key"))
+                    or any(k != "node_name" for k in (data.get("settings") or {}))
+                    or bool(trimmed_count)
+                    or (new_node_name != prev_node_name and not node_name_applied_live)
+                )
+                if restart_needed:
+                    parts.append("Restart required to apply the remaining changes.")
+                message = (base + (" " + " ".join(parts) if parts else "")).strip()
                 return self._success(identity, message=message)
 
             # Room server path
