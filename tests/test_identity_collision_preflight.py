@@ -29,7 +29,10 @@ def _config(*, companions=()):
     }
 
 
-def test_startup_preflight_rejects_default_repeater_hash_collision():
+def test_startup_preflight_allows_companion_repeater_prefix_collision():
+    """A companion that shares the repeater's one-byte prefix is tolerated:
+    the two occupy different runtime maps and the receive path selects the
+    owner by MAC verification, so preflight must not abort startup."""
     daemon = RepeaterDaemon(
         _config(companions=({"name": "comp", "identity_key": "10" * 32},)),
         radio=object(),
@@ -37,8 +40,8 @@ def test_startup_preflight_rejects_default_repeater_hash_collision():
     local_identity = _SeedFirstByteIdentity(b"\x10" * 32)
 
     with patch("openhop_core.LocalIdentity", _SeedFirstByteIdentity):
-        with pytest.raises(IdentityConfigurationError, match="one-byte public-key prefixes"):
-            daemon._preflight_configured_local_identities(local_identity)
+        # Does not raise.
+        daemon._preflight_configured_local_identities(local_identity)
 
 
 @pytest.mark.asyncio
@@ -93,10 +96,13 @@ async def test_invalid_config_entry_logs_once_across_preflight_and_load(caplog):
 
 @pytest.mark.asyncio
 async def test_hot_added_companion_collision_is_rejected_before_stateful_setup():
+    # A second companion sharing an existing companion's one-byte prefix is a
+    # same-namespace collision (shared companion_bridges slot and SQLite
+    # namespace) and must be rejected before any stateful setup.
     daemon = RepeaterDaemon(_config(), radio=object())
     daemon.identity_manager = IdentityManager({})
     daemon.identity_manager.register_identity(
-        "repeater", _SeedFirstByteIdentity(b"\x33" * 32), {}, "repeater"
+        "existing", _SeedFirstByteIdentity(b"\x33" * 32), {}, "companion"
     )
 
     comp_config = {"name": "comp", "identity_key": "33" * 32, "settings": {}}

@@ -34,8 +34,8 @@ def test_identity_manager_rejects_duplicate_names_without_mutating_state():
     id_b = _FakeIdentity(bytes([0x22]) + b"B" * 31)
 
     assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
-    assert "already registered" in mgr.registration_error("alpha", id_b)
-    assert mgr.validate_identity("alpha", id_b) is False
+    assert "already registered" in mgr.registration_error("alpha", id_b, "companion")
+    assert mgr.validate_identity("alpha", id_b, "companion") is False
     assert mgr.get_identity_by_hash(0x22) is None
 
 
@@ -63,26 +63,43 @@ def test_identity_manager_list_and_type_filtering():
 
 def test_identity_manager_list_handles_none_identity_fields():
     mgr = IdentityManager(config={})
-    mgr.identities[0x44] = (None, {}, "repeater")
-    mgr.registered_hashes[0x44] = "repeater:ghost"
+    mgr.named_identities["ghost"] = (None, {}, "repeater")
 
     listed = mgr.list_identities()
     assert listed[0]["address"] == "N/A"
     assert listed[0]["public_key"] is None
 
 
-def test_validate_specs_rejects_intra_batch_hash_collision():
+def test_validate_specs_rejects_intra_batch_same_namespace_hash_collision():
+    """Two identities in the same routing namespace (here, two companions)
+    cannot share a one-byte prefix."""
     mgr = IdentityManager(config={})
     id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
     id_b = _FakeIdentity(bytes([0x11]) + b"B" * 31)
 
-    with pytest.raises(IdentityConfigurationError, match="one-byte public-key prefixes"):
+    with pytest.raises(IdentityConfigurationError, match="one-byte public-key prefix"):
         mgr.validate_specs(
             [
-                IdentitySpec("alpha", id_a, {}, "repeater"),
+                IdentitySpec("alpha", id_a, {}, "companion"),
                 IdentitySpec("beta", id_b, {}, "companion"),
             ]
         )
+
+
+def test_validate_specs_allows_intra_batch_cross_namespace_hash_collision():
+    """A companion and a server-side identity may share a one-byte prefix: the
+    receive path offers a colliding packet to both and MAC verification decides
+    the owner."""
+    mgr = IdentityManager(config={})
+    repeater_id = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    companion_id = _FakeIdentity(bytes([0x11]) + b"B" * 31)
+
+    mgr.validate_specs(
+        [
+            IdentitySpec("alpha", repeater_id, {}, "repeater"),
+            IdentitySpec("beta", companion_id, {}, "companion"),
+        ]
+    )
 
 
 def test_validate_specs_rejects_intra_batch_duplicate_name():
@@ -107,8 +124,9 @@ def test_validate_specs_rejects_registered_collisions_without_mutation():
 
     assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
 
+    # Same-namespace (server/server) prefix collision against a registered id.
     with pytest.raises(IdentityConfigurationError, match="conflicts"):
-        mgr.validate_specs([IdentitySpec("beta", id_hash_collision, {}, "companion")])
+        mgr.validate_specs([IdentitySpec("beta", id_hash_collision, {}, "room_server")])
     with pytest.raises(IdentityConfigurationError, match="already registered"):
         mgr.validate_specs([IdentitySpec("alpha", id_name_collision, {}, "companion")])
 
