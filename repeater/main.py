@@ -1020,6 +1020,7 @@ class RepeaterDaemon:
                     local_hash=self.local_hash,
                     stats_getter=self._get_companion_stats,
                     batt_getter=self._companion_battery_mv,
+                    sensor_manager=self.sensor_manager,
                     storage_dir=self._companion_storage_dir(),
                     control_handler=(
                         self.discovery_helper.control_handler if self.discovery_helper else None
@@ -1263,6 +1264,7 @@ class RepeaterDaemon:
             local_hash=self.local_hash,
             stats_getter=self._get_companion_stats,
             batt_getter=self._companion_battery_mv,
+            sensor_manager=self.sensor_manager,
             storage_dir=self._companion_storage_dir(),
             control_handler=(
                 self.discovery_helper.control_handler if self.discovery_helper else None

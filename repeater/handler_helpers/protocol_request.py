@@ -6,6 +6,7 @@ Provides repeater-specific callbacks for status and telemetry requests.
 
 import asyncio
 import logging
+import math
 import struct
 import time
 
@@ -22,12 +23,13 @@ from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
     encode_barometric_pressure,
     encode_current,
+    encode_gps,
     encode_power,
     encode_relative_humidity,
     encode_temperature,
     encode_voltage,
 )
-from openhop_core.protocol.constants import TELEM_PERM_ENVIRONMENT
+from openhop_core.protocol.constants import TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 
 logger = logging.getLogger("ProtocolRequestHelper")
 
@@ -288,16 +290,7 @@ class ProtocolRequestHelper:
         # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
         lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
 
-        # One channel per sensor reading (matches firmware channel assignment).
-        if perm_mask & TELEM_PERM_ENVIRONMENT:
-            channel = TELEM_CHANNEL_SELF + 1
-            for reading in readings:
-                entry = self._encode_power_reading(
-                    channel, reading
-                ) + self._encode_environment_reading(channel, reading)
-                if entry:
-                    lpp.extend(entry)
-                    channel += 1
+        lpp.extend(self.encode_sensor_telemetry(readings, perm_mask))
 
         logger.debug(
             "GET_TELEMETRY: perm_mask=0x%02X, %d LPP bytes",
@@ -305,6 +298,44 @@ class ProtocolRequestHelper:
             len(lpp),
         )
         return bytes(lpp)
+
+    @classmethod
+    def encode_sensor_telemetry(cls, readings, perm_mask: int) -> bytes:
+        """Match EnvironmentSensorManager: GPS on self, then configured sensors."""
+        lpp = bytearray()
+        if perm_mask & TELEM_PERM_LOCATION:
+            for reading in readings:
+                entry = cls._encode_location_reading(reading)
+                if entry:
+                    lpp.extend(entry)
+                    break  # Firmware has one node position.
+        if perm_mask & TELEM_PERM_ENVIRONMENT:
+            channel = TELEM_CHANNEL_SELF + 1
+            for reading in readings:
+                entry = cls._encode_power_reading(channel, reading)
+                entry += cls._encode_environment_reading(channel, reading)
+                if entry:
+                    lpp.extend(entry)
+                    channel += 1
+        return bytes(lpp)
+
+    @staticmethod
+    def _encode_location_reading(reading) -> bytes:
+        if not reading.get("ok"):
+            return b""
+        data = reading.get("data") or {}
+        # Cached modem coordinates can outlive a fix or an enabled GPS receiver.
+        if any(data.get(key) is False for key in ("fix_valid", "gps_enabled", "gps_available")):
+            return b""
+        try:
+            lat, lon, alt = (float(data[key]) for key in ("latitude", "longitude", "altitude_m"))
+            if not all(math.isfinite(v) for v in (lat, lon, alt)):
+                return b""
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180 and -83886.08 <= alt < 83886.08):
+                return b""
+            return encode_gps(TELEM_CHANNEL_SELF, lat, lon, alt)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return b""
 
     def _get_sensor_readings(self):
         """Return the latest cached sensor readings (empty list if unavailable)."""

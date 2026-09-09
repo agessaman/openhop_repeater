@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 from typing import Callable, Optional
 
@@ -41,6 +42,7 @@ class CompanionFrameServer(_BaseFrameServer):
         control_handler=None,
         batt_getter: Callable[[], int] | None = None,
         storage_dir: str | None = None,
+        sensor_manager=None,
     ):
         super().__init__(
             bridge=bridge,
@@ -58,6 +60,64 @@ class CompanionFrameServer(_BaseFrameServer):
         self.sqlite_handler = sqlite_handler
         self.batt_getter = batt_getter
         self.storage_dir = storage_dir
+        self.sensor_manager = sensor_manager
+
+    def _sensor_readings(self):
+        if self.sensor_manager is None:
+            return []
+        try:
+            return (self.sensor_manager.get_summary() or {}).get("readings") or []
+        except Exception:
+            logger.debug("sensor lookup failed", exc_info=True)
+            return []
+
+    @staticmethod
+    def _mcu_reading(readings):
+        """Pick the reading standing in for firmware's ``board.getMCUTemperature()``."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            try:
+                temperature = float((reading.get("data") or {}).get("die_temperature_c"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(temperature):
+                return reading, temperature
+        return None, None
+
+    @staticmethod
+    def _without_aliased_temperature(reading, temperature: float):
+        """Drop ``temperature_c`` when it only mirrors the die temperature."""
+        data = reading.get("data") or {}
+        try:
+            if float(data.get("temperature_c")) != temperature:
+                return reading  # a genuinely separate ambient probe: keep it
+        except (TypeError, ValueError, OverflowError):
+            return reading
+        return {**reading, "data": {k: v for k, v in data.items() if k != "temperature_c"}}
+
+    def _get_mcu_temperature_c(self) -> Optional[float]:
+        return self._mcu_reading(self._sensor_readings())[1]
+
+    def _get_self_telemetry_lpp(self) -> bytes:
+        from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
+
+        readings = self._sensor_readings()
+        # The firmware MCU is the board, never an entry in sensors.querySensors(),
+        # so channel 1 and the sensor channels never repeat a value. openhop_modem
+        # aliases die_temperature_c onto temperature_c for RepeaterUI, which would
+        # otherwise emit the same probe twice once channel 1 carries the MCU slot.
+        mcu_reading, temperature = self._mcu_reading(readings)
+        if mcu_reading is not None:
+            readings = [
+                (
+                    self._without_aliased_temperature(reading, temperature)
+                    if reading is mcu_reading
+                    else reading
+                )
+                for reading in readings
+            ]
+        return ProtocolRequestHelper.encode_sensor_telemetry(readings, 0xFF)
 
     def _get_batt_and_storage(self) -> tuple[int, int, int]:
         """Report battery millivolts and storage usage to companion clients.
