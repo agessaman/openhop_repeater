@@ -215,6 +215,109 @@ async def test_bridge_tx_crosses_to_other_radio():
     assert b.sent == [b"fwd-1"]
 
 
+def _fanout_cfg(fabric: dict, radio_ids=("local", "link")) -> dict:
+    return {
+        "fabric": {"default_radio": radio_ids[0], **fabric},
+        "radios": [
+            {"id": rid, "radio_type": "sx1262", "radio": {"frequency": 100 + i}, "sx1262": {}}
+            for i, rid in enumerate(radio_ids)
+        ],
+    }
+
+
+def _build_fanout(cfg):
+    """build_radio_stack with fake hardware; returns (radio, meta, factory_mock)."""
+    radios = {}
+
+    def fake_get(board):
+        freq = (board.get("radio") or {}).get("frequency")
+        return radios.setdefault(freq, _FakeRadio(str(freq)))
+
+    with patch("repeater.config.get_radio_for_board", side_effect=fake_get) as factory:
+        radio, meta = build_radio_stack(cfg)
+    return radio, meta, factory
+
+
+def test_bridge_without_fanout_options_keeps_defaults():
+    _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": "bridge"}))
+    assert meta["tx_mode"] == "bridge"
+    assert meta["repeat_on_ingress"] is False
+    assert meta["local_tx_mode"] == "default"
+
+
+def test_fanout_option_defaults_without_fabric_section():
+    with patch("repeater.config.get_radio_for_board", return_value=_FakeRadio()):
+        _, meta = build_radio_stack({"radio_type": "sx1262"})
+    assert meta["repeat_on_ingress"] is False
+    assert meta["local_tx_mode"] == "default"
+
+
+def test_repeat_on_ingress_accepted_with_bridge_and_two_radios():
+    _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": "bridge", "repeat_on_ingress": True}))
+    assert meta["repeat_on_ingress"] is True
+    assert meta["radio_ids"] == ["local", "link"]
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        # one radio in a radios: list
+        _fanout_cfg({"tx_mode": "bridge", "repeat_on_ingress": True}, radio_ids=("local",)),
+        # use_fabric around a single radio
+        {
+            "radio_type": "sx1262",
+            "fabric": {"use_fabric": True, "tx_mode": "bridge", "repeat_on_ingress": True},
+        },
+        # legacy single radio, no fabric at all
+        {"radio_type": "sx1262", "fabric": {"tx_mode": "bridge", "repeat_on_ingress": True}},
+    ],
+    ids=["radios-list", "use_fabric", "legacy"],
+)
+def test_repeat_on_ingress_rejected_with_one_radio(cfg):
+    with patch("repeater.config.get_radio_for_board", return_value=_FakeRadio()) as factory:
+        with pytest.raises(ValueError, match="exactly two radios"):
+            build_radio_stack(cfg)
+    factory.assert_not_called()  # rejected before any hardware is opened
+
+
+def test_repeat_on_ingress_rejected_with_three_radios():
+    cfg = _fanout_cfg({"tx_mode": "bridge", "repeat_on_ingress": True}, radio_ids=("a", "b", "c"))
+    with pytest.raises(ValueError, match="exactly two radios"):
+        _build_fanout(cfg)
+
+
+@pytest.mark.parametrize("tx_mode", ["sticky", "default"])
+def test_repeat_on_ingress_rejected_without_bridge(tx_mode):
+    cfg = _fanout_cfg({"tx_mode": tx_mode, "repeat_on_ingress": True})
+    with pytest.raises(ValueError, match="requires fabric.tx_mode=bridge"):
+        _build_fanout(cfg)
+
+
+def test_repeat_on_ingress_rejects_non_boolean():
+    cfg = _fanout_cfg({"tx_mode": "bridge", "repeat_on_ingress": "sometimes"})
+    with pytest.raises(ValueError, match="repeat_on_ingress must be true or false"):
+        _build_fanout(cfg)
+
+
+@pytest.mark.parametrize("tx_mode", ["default", "sticky", "bridge"])
+def test_local_tx_mode_all_accepted_with_two_radios(tx_mode):
+    _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": tx_mode, "local_tx_mode": "ALL"}))
+    assert meta["local_tx_mode"] == "all"
+
+
+def test_local_tx_mode_all_rejected_with_one_radio():
+    cfg = _fanout_cfg({"local_tx_mode": "all"}, radio_ids=("local",))
+    with pytest.raises(ValueError, match="local_tx_mode=all requires exactly two radios"):
+        _build_fanout(cfg)
+
+
+@pytest.mark.parametrize("value", ["both", "multicast", 3])
+def test_invalid_local_tx_mode_rejected(value):
+    cfg = _fanout_cfg({"tx_mode": "bridge", "local_tx_mode": value})
+    with pytest.raises(ValueError, match="Unknown fabric.local_tx_mode"):
+        _build_fanout(cfg)
+
+
 def test_merge_radio_entry_preserves_per_radio_ch341():
     global_cfg = {
         "radio_type": "sx1262_ch341",

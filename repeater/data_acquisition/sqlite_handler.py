@@ -133,6 +133,7 @@ class SQLiteHandler:
                         tx_delay_ms REAL,
                         rx_radio_id TEXT,
                         tx_radio_id TEXT,
+                        tx_radio_ids TEXT,
                         packet_hash TEXT,
                         original_path TEXT,
                         forwarded_path TEXT,
@@ -818,6 +819,27 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 17: every radio that carried a fanned-out packet, as a
+                # JSON list beside the scalar primary tx_radio_id.
+                migration_name = "add_packet_tx_radio_ids"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(packets)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "tx_radio_ids" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN tx_radio_ids TEXT")
+                        logger.info("Added tx_radio_ids column to packets table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -1018,6 +1040,18 @@ class SQLiteHandler:
             logger.error(f"Failed to list API tokens: {e}")
             return []
 
+    @staticmethod
+    def _decode_packet_row(row: dict) -> dict:
+        """Decode a packets row's JSON ``tx_radio_ids`` column back into a list."""
+        raw = row.get("tx_radio_ids")
+        if isinstance(raw, str):
+            try:
+                decoded = json.loads(raw)
+            except ValueError:
+                decoded = None
+            row["tx_radio_ids"] = decoded if isinstance(decoded, list) else None
+        return row
+
     def store_packet(self, record: dict):
         try:
             with self._connect() as conn:
@@ -1039,10 +1073,10 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         record.get("timestamp", time.time()),
@@ -1067,6 +1101,11 @@ class SQLiteHandler:
                         record.get("tx_delay_ms"),
                         record.get("rx_radio_id"),
                         record.get("tx_radio_id"),
+                        (
+                            json.dumps(list(record["tx_radio_ids"]))
+                            if record.get("tx_radio_ids")
+                            else None
+                        ),
                         record.get("packet_hash"),
                         orig_path_val,
                         fwd_path_val,
@@ -2091,7 +2130,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
@@ -2101,7 +2140,7 @@ class SQLiteHandler:
                     (limit,),
                 ).fetchall()
 
-                return [dict(row) for row in packets]
+                return [self._decode_packet_row(dict(row)) for row in packets]
 
         except Exception as e:
             logger.error(f"Failed to get recent packets: {e}")
@@ -2146,7 +2185,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
@@ -2163,7 +2202,7 @@ class SQLiteHandler:
 
                 packets = conn.execute(query, params).fetchall()
 
-                return [dict(row) for row in packets]
+                return [self._decode_packet_row(dict(row)) for row in packets]
 
         except Exception as e:
             logger.error(f"Failed to get filtered packets: {e}")
@@ -2281,7 +2320,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
@@ -2290,7 +2329,7 @@ class SQLiteHandler:
                     (packet_hash,),
                 ).fetchone()
 
-                return dict(packet) if packet else None
+                return self._decode_packet_row(dict(packet)) if packet else None
 
         except Exception as e:
             logger.error(f"Failed to get packet by hash: {e}")
@@ -2309,7 +2348,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
@@ -2318,7 +2357,7 @@ class SQLiteHandler:
                     (packet_id,),
                 ).fetchone()
 
-                return dict(packet) if packet else None
+                return self._decode_packet_row(dict(packet)) if packet else None
 
         except Exception as e:
             logger.error(f"Failed to get packet by id: {e}")

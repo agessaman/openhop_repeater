@@ -838,12 +838,70 @@ def _apply_fabric_tx_mode(fabric, mode: str) -> None:
     raise ValueError(f"Unknown fabric.tx_mode={mode!r}. Supported: default, sticky, bridge")
 
 
+FABRIC_LOCAL_TX_MODES = ("default", "all")
+
+
+def parse_fabric_fanout_options(fabric_cfg) -> tuple:
+    """Return ``(repeat_on_ingress, local_tx_mode)`` from a ``fabric:`` mapping.
+
+    Both default to the pre-fan-out behaviour (``False`` / ``"default"``).
+    Raises ValueError for values with no defined meaning.
+    """
+    if not isinstance(fabric_cfg, dict):
+        return False, "default"
+
+    repeat_on_ingress = fabric_cfg.get("repeat_on_ingress", False)
+    if repeat_on_ingress is None:
+        repeat_on_ingress = False
+    if not isinstance(repeat_on_ingress, bool):
+        raise ValueError(
+            f"fabric.repeat_on_ingress must be true or false, got {repeat_on_ingress!r}"
+        )
+
+    raw_mode = fabric_cfg.get("local_tx_mode", "default")
+    local_tx_mode = str(raw_mode if raw_mode is not None else "default").strip().lower()
+    if local_tx_mode == "":
+        local_tx_mode = "default"
+    if local_tx_mode not in FABRIC_LOCAL_TX_MODES:
+        raise ValueError(
+            f"Unknown fabric.local_tx_mode={raw_mode!r}. Supported: "
+            + ", ".join(FABRIC_LOCAL_TX_MODES)
+        )
+    return repeat_on_ingress, local_tx_mode
+
+
+def _validate_fabric_fanout(fabric_cfg, tx_mode: str, radio_count: int) -> tuple:
+    """Reject fan-out options that have no defined meaning for this radio layout.
+
+    Fan-out is defined only for an exactly-two-radio Fabric: ``repeat_on_ingress``
+    extends the deterministic A<->B bridge, and ``local_tx_mode: all`` sends once
+    per radio. Returns the parsed ``(repeat_on_ingress, local_tx_mode)``.
+    """
+    repeat_on_ingress, local_tx_mode = parse_fabric_fanout_options(fabric_cfg)
+    if repeat_on_ingress:
+        mode_l = (tx_mode or "default").strip().lower()
+        if mode_l != "bridge":
+            raise ValueError(
+                f"fabric.repeat_on_ingress requires fabric.tx_mode=bridge (got {tx_mode!r})"
+            )
+        if radio_count != 2:
+            raise ValueError(
+                f"fabric.repeat_on_ingress requires exactly two radios (got {radio_count})"
+            )
+    if local_tx_mode == "all" and radio_count != 2:
+        raise ValueError(
+            f"fabric.local_tx_mode=all requires exactly two radios (got {radio_count})"
+        )
+    return repeat_on_ingress, local_tx_mode
+
+
 def build_radio_stack(config: dict):
     """Build single- or multi-radio stack for the repeater.
 
     - No ``radios:`` -> legacy ``get_radio_for_board(config)``.
     - ``radios:`` list -> FabricRadio over N physical radios.
-    - ``fabric:`` knobs: default_radio, tx_mode (default|sticky|bridge), use_fabric.
+    - ``fabric:`` knobs: default_radio, tx_mode (default|sticky|bridge), use_fabric,
+      repeat_on_ingress, local_tx_mode (default|all).
 
     Returns (radio, meta).
     """
@@ -853,11 +911,17 @@ def build_radio_stack(config: dict):
     tx_mode = str(fabric_cfg.get("tx_mode", "default"))
     default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
 
+    # Validate before opening any hardware so a bad combination fails fast.
+    radio_count = len(radios_cfg) if isinstance(radios_cfg, list) and radios_cfg else 1
+    repeat_on_ingress, local_tx_mode = _validate_fabric_fanout(fabric_cfg, tx_mode, radio_count)
+
     meta = {
         "mode": "single",
         "radio_ids": [],
         "default_radio": None,
         "tx_mode": tx_mode,
+        "repeat_on_ingress": repeat_on_ingress,
+        "local_tx_mode": local_tx_mode,
         "fabric": False,
     }
 

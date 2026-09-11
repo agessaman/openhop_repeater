@@ -161,6 +161,60 @@ def test_recording_works_after_upgrade(legacy_db):
     assert after == before + 1
 
 
+def test_upgrade_adds_tx_radio_ids_without_touching_existing_rows(legacy_db):
+    d, path = legacy_db
+    assert "tx_radio_ids" not in _columns(path), "fixture is not a legacy db"
+
+    SQLiteHandler(Path(d))
+
+    assert "tx_radio_ids" in _columns(path)
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute("SELECT timestamp, type, length, tx_radio_ids FROM packets").fetchall()
+    finally:
+        con.close()
+    assert rows == [(1.0, 1, 10, None)]
+
+
+def test_tx_radio_ids_round_trip_through_every_packet_read():
+    d = tempfile.mkdtemp()
+    try:
+        handler = SQLiteHandler(Path(d))
+        base = {"type": 2, "route": 1, "length": 4, "transmitted": True}
+        handler.store_packet(
+            {
+                **base,
+                "timestamp": 5.0,
+                "packet_hash": "FANOUT0000000001",
+                "rx_radio_id": "local",
+                "tx_radio_id": "link",
+                "tx_radio_ids": ["link", "local"],
+            }
+        )
+        handler.store_packet({**base, "timestamp": 6.0, "packet_hash": "SINGLE0000000002"})
+
+        con = sqlite3.connect(os.path.join(d, "repeater.db"))
+        try:
+            stored = con.execute(
+                "SELECT tx_radio_ids FROM packets WHERE packet_hash = ?", ("FANOUT0000000001",)
+            ).fetchone()[0]
+        finally:
+            con.close()
+        assert stored == '["link", "local"]'  # JSON text on disk
+
+        by_hash = handler.get_packet_by_hash("FANOUT0000000001")
+        assert by_hash["tx_radio_id"] == "link"
+        assert by_hash["tx_radio_ids"] == ["link", "local"]
+        assert handler.get_packet_by_id(by_hash["id"])["tx_radio_ids"] == ["link", "local"]
+
+        for rows in (handler.get_recent_packets(10), handler.get_filtered_packets(limit=10)):
+            by = {row["packet_hash"]: row for row in rows}
+            assert by["FANOUT0000000001"]["tx_radio_ids"] == ["link", "local"]
+            assert by["SINGLE0000000002"]["tx_radio_ids"] is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_fresh_database_also_gets_column_and_index():
     """The fresh-install path must be unaffected by moving the index."""
     d = tempfile.mkdtemp()
