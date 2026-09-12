@@ -268,6 +268,28 @@ async def test_returned_copies_are_deduplicated_without_new_fanout():
 
 
 @pytest.mark.asyncio
+async def test_own_transmission_heard_on_the_other_radio_is_not_a_neighbour():
+    """Same frequency: each radio hears the other send, bytes exactly as sent."""
+    rig = _Rig({"repeat_on_ingress": True})
+    payload = b"\x42\x43\x44"
+    assert await rig.handler(_flood(payload=payload, path=b"\x11", rx="local"), _rx("local"))
+
+    for ingress in ("link", "local"):
+        echo = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH]), rx=ingress)
+        assert await rig.handler(echo, _rx(ingress)) is False
+    # A neighbour repeating our copy appends its own hash and is still a neighbour.
+    relayed = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH, 0x33]), rx="link")
+    assert await rig.handler(relayed, _rx("link")) is False
+
+    links = rig.handler.neighbour_link_tracker.links
+    assert set(links) == {"1:11", "1:33"}
+    assert set(links["1:11"].radios) == {"local"}
+    assert set(links["1:33"].radios) == {"link"}
+    # The echoes are still stored as the receptions they were.
+    assert [r["drop_reason"] for r in rig.records()[1:]] == ["Duplicate"] * 3
+
+
+@pytest.mark.asyncio
 async def test_egress_follows_captured_ingress_not_the_latest_rx():
     rig = _Rig({"repeat_on_ingress": True})
     rig.handler._calculate_tx_delay = lambda packet, snr=0.0: 0.05
