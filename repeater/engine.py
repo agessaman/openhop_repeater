@@ -35,6 +35,7 @@ from openhop_core.protocol.packet_utils import (
 )
 
 from repeater.airtime import AirtimeManager
+from repeater.config import fabric_origin_tx
 from repeater.data_acquisition import StorageCollector
 from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
 from repeater.neighbour_links import NeighbourLinkTracker
@@ -377,7 +378,7 @@ class RepeaterHandler(BaseHandler):
         tx_radio_ids_sent = None
         if local_transmission and not rx_radio_id:
             # Originated here: companion, repeater/room identity, protocol reply.
-            tx_radio_ids = self._resolve_local_tx_radio_ids()
+            tx_radio_ids = self._resolve_origin_tx_radio_ids()
         else:
             # Heard on RF and being repeated. A helper re-emitting a received
             # packet through the local path (TRACE forwarding) still carries its
@@ -1949,15 +1950,14 @@ class RepeaterHandler(BaseHandler):
         radio_ids = self._resolve_relay_tx_radio_ids(rx_radio_id)
         return radio_ids[0] if radio_ids else None
 
-    def _resolve_local_tx_radio_ids(self) -> Optional[Tuple[str, ...]]:
+    def _resolve_origin_tx_radio_ids(self) -> Optional[Tuple[str, ...]]:
         """Egress radios for a packet this node originates.
 
-        With fabric.local_tx_mode=all and exactly two radios, every radio, the
+        With fabric.origin_tx=all and exactly two radios, every radio, the
         default radio first. Otherwise None: the existing fabric selection
         (default radio / tx_mode selector) stays authoritative.
         """
-        mode = self._fabric_cfg().get("local_tx_mode", "default")
-        if str(mode if mode is not None else "default").strip().lower() != "all":
+        if fabric_origin_tx(self._fabric_cfg()) != "all":
             return None
         fabric, ids = self._fabric_endpoints()
         if ids is None or len(ids) != 2:

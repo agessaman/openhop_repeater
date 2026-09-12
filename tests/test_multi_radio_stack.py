@@ -242,14 +242,14 @@ def test_bridge_without_fanout_options_keeps_defaults():
     _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": "bridge"}))
     assert meta["tx_mode"] == "bridge"
     assert meta["repeat_on_ingress"] is False
-    assert meta["local_tx_mode"] == "default"
+    assert meta["origin_tx"] == "default"
 
 
 def test_fanout_option_defaults_without_fabric_section():
     with patch("repeater.config.get_radio_for_board", return_value=_FakeRadio()):
         _, meta = build_radio_stack({"radio_type": "sx1262"})
     assert meta["repeat_on_ingress"] is False
-    assert meta["local_tx_mode"] == "default"
+    assert meta["origin_tx"] == "default"
 
 
 def test_repeat_on_ingress_accepted_with_bridge_and_two_radios():
@@ -300,22 +300,43 @@ def test_repeat_on_ingress_rejects_non_boolean():
 
 
 @pytest.mark.parametrize("tx_mode", ["default", "sticky", "bridge"])
-def test_local_tx_mode_all_accepted_with_two_radios(tx_mode):
-    _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": tx_mode, "local_tx_mode": "ALL"}))
-    assert meta["local_tx_mode"] == "all"
+def test_origin_tx_all_accepted_with_two_radios(tx_mode):
+    _, meta, _ = _build_fanout(_fanout_cfg({"tx_mode": tx_mode, "origin_tx": "ALL"}))
+    assert meta["origin_tx"] == "all"
 
 
-def test_local_tx_mode_all_rejected_with_one_radio():
-    cfg = _fanout_cfg({"local_tx_mode": "all"}, radio_ids=("local",))
-    with pytest.raises(ValueError, match="local_tx_mode=all requires exactly two radios"):
+@pytest.mark.parametrize("key", ["origin_tx", "local_tx_mode"])
+def test_origin_tx_all_rejected_with_one_radio(key):
+    cfg = _fanout_cfg({key: "all"}, radio_ids=("local",))
+    with pytest.raises(ValueError, match=f"{key}=all requires exactly two radios"):
         _build_fanout(cfg)
 
 
+@pytest.mark.parametrize("key", ["origin_tx", "local_tx_mode"])
 @pytest.mark.parametrize("value", ["both", "multicast", 3])
-def test_invalid_local_tx_mode_rejected(value):
-    cfg = _fanout_cfg({"tx_mode": "bridge", "local_tx_mode": value})
-    with pytest.raises(ValueError, match="Unknown fabric.local_tx_mode"):
+def test_invalid_origin_tx_rejected(key, value):
+    cfg = _fanout_cfg({"tx_mode": "bridge", key: value})
+    with pytest.raises(ValueError, match=f"Unknown fabric.{key}"):
         _build_fanout(cfg)
+
+
+def test_origin_tx_accepts_its_former_name():
+    _, meta, _ = _build_fanout(_fanout_cfg({"local_tx_mode": "all"}))
+    assert meta["origin_tx"] == "all"
+    assert "local_tx_mode" not in meta
+
+
+def test_origin_tx_and_former_name_may_agree():
+    _, meta, _ = _build_fanout(_fanout_cfg({"origin_tx": "all", "local_tx_mode": " All "}))
+    assert meta["origin_tx"] == "all"
+
+
+def test_origin_tx_conflicting_with_former_name_rejected():
+    cfg = _fanout_cfg({"origin_tx": "default", "local_tx_mode": "all"})
+    with patch("repeater.config.get_radio_for_board") as factory:
+        with pytest.raises(ValueError, match="conflicts with fabric.local_tx_mode"):
+            build_radio_stack(cfg)
+    factory.assert_not_called()
 
 
 def test_merge_radio_entry_preserves_per_radio_ch341():

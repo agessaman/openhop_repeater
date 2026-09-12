@@ -437,7 +437,7 @@ async def test_fanout_transmissions_never_overlap():
 
 @pytest.mark.asyncio
 async def test_monitor_mode_blocks_relay_fanout_but_not_local_fanout():
-    rig = _Rig({"repeat_on_ingress": True, "local_tx_mode": "all"}, mode="monitor")
+    rig = _Rig({"repeat_on_ingress": True, "origin_tx": "all"}, mode="monitor")
 
     assert await rig.handler(_flood(rx="local"), _rx("local")) is False
     assert rig.air.frames == []
@@ -454,7 +454,7 @@ async def test_monitor_mode_blocks_relay_fanout_but_not_local_fanout():
 
 @pytest.mark.asyncio
 async def test_local_origin_default_mode_keeps_single_fabric_send():
-    rig = _Rig({"repeat_on_ingress": True})  # local_tx_mode defaults to "default"
+    rig = _Rig({"repeat_on_ingress": True})  # origin_tx defaults to "default"
     assert await rig.handler(_flood(), {}, local_transmission=True) is True
     assert rig.air.order == ["local"]
     assert rig.sent_radio_ids == [None]  # the fabric picks, as before
@@ -466,7 +466,7 @@ async def test_local_origin_default_mode_keeps_single_fabric_send():
     "default_radio, expected", [("local", ["local", "link"]), ("link", ["link", "local"])]
 )
 async def test_local_origin_all_mode_sends_on_every_radio_default_first(default_radio, expected):
-    rig = _Rig({"local_tx_mode": "all", "default_radio": default_radio})
+    rig = _Rig({"origin_tx": "all", "default_radio": default_radio})
     pkt = _direct(path=bytes([0x42, 0x43]))
     pkt._injected_origin_hash = "0x1a"
 
@@ -492,6 +492,20 @@ async def test_local_origin_all_mode_sends_on_every_radio_default_first(default_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fabric, expected",
+    [
+        ({"local_tx_mode": "all"}, ["local", "link"]),  # the option's former name
+        ({"origin_tx": "default", "local_tx_mode": "all"}, ["local"]),  # new name wins
+    ],
+)
+async def test_origin_tx_old_name_still_selects_the_mode(fabric, expected):
+    rig = _Rig(fabric)
+    assert await rig.handler(_flood(), {}, local_transmission=True) is True
+    assert rig.air.order == expected
+
+
+@pytest.mark.asyncio
 async def test_local_resend_of_a_received_packet_resolves_as_a_relay():
     """TRACE forwarding re-injects the received packet, still tagged with its ingress."""
     rig = _Rig({"repeat_on_ingress": True})
@@ -502,7 +516,7 @@ async def test_local_resend_of_a_received_packet_resolves_as_a_relay():
 
 @pytest.mark.asyncio
 async def test_local_fanout_evaluates_link_health_per_radio():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.handler.config["delays"]["local_tx_link_wait_seconds"] = 0.6
     rig.link.is_connected = False
     rig.link.is_degraded = True
@@ -520,7 +534,7 @@ async def test_local_fanout_evaluates_link_health_per_radio():
 @pytest.mark.asyncio
 async def test_down_primary_does_not_hold_up_the_healthy_radio():
     """Primary-first ordering applies when both radios are ready, never as a wait."""
-    rig = _Rig({"local_tx_mode": "all"})  # "local" is the primary egress
+    rig = _Rig({"origin_tx": "all"})  # "local" is the primary egress
     rig.handler.config["delays"]["local_tx_link_wait_seconds"] = 0.6
     rig.local.is_connected = False
     rig.local.is_degraded = True
@@ -538,7 +552,7 @@ async def test_down_primary_does_not_hold_up_the_healthy_radio():
 @pytest.mark.asyncio
 async def test_every_egress_carries_the_same_scope_and_hash_mode():
     """TX-time normalisation is decided once, so a live change mid-fan-out cannot split it."""
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.dispatcher.default_flood_transport_key = get_auto_key_for("#fanout")
     rig.dispatcher.set_default_path_hash_mode(1)
 
@@ -562,7 +576,7 @@ async def test_every_egress_carries_the_same_scope_and_hash_mode():
 @pytest.mark.asyncio
 async def test_scoped_fanout_meters_the_normalised_length():
     """Scoping adds transport codes; every duty-cycle gate must see those bytes."""
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.dispatcher.default_flood_transport_key = get_auto_key_for("#fanout")
     mgr = rig.handler.airtime_mgr
     pkt = _flood(payload=b"\x5a\x01\x02\x03", payload_type=PAYLOAD_TYPE_GRP_TXT)
@@ -581,7 +595,7 @@ async def test_scoped_fanout_meters_the_normalised_length():
 
 @pytest.mark.asyncio
 async def test_cancelling_a_fanout_stops_pending_egresses_and_frees_the_radio():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.local.airtime_s = 0.2
     task = await rig.handler.schedule_retransmit_fanout(
         _flood(), 0.0, 0.0, ("local", "link"), local_transmission=True
@@ -654,7 +668,7 @@ async def _until(predicate, timeout=3.0):
 
 @pytest.mark.asyncio
 async def test_companion_injection_fans_out_as_one_logical_packet():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
     pkt = _flood(payload=b"\x5a\x01\x02\x03", payload_type=PAYLOAD_TYPE_GRP_TXT)
 
@@ -674,7 +688,7 @@ async def test_companion_injection_fans_out_as_one_logical_packet():
 
 @pytest.mark.asyncio
 async def test_originating_companion_never_receives_its_fanned_out_packet():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
     origin, other = _bridge(), _bridge()
     router.daemon.companion_bridges = {0x1A: origin, 0x2B: other}
@@ -699,7 +713,7 @@ async def test_originating_companion_never_receives_its_fanned_out_packet():
 )
 async def test_non_companion_local_origins_fan_out(payload_type, route, path):
     """Adverts and helper replies reach the air the way main.py and helpers send them."""
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
     pkt = _packet(route, payload_type, bytes(range(1, 33)), path)
 
@@ -712,7 +726,7 @@ async def test_non_companion_local_origins_fan_out(payload_type, route, path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ack_radio", ["local", "link"])
 async def test_directed_message_waits_for_one_ack_from_either_radio(ack_radio):
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
     crc = 0x1234ABCD
     registered = []
@@ -739,7 +753,7 @@ async def test_directed_message_waits_for_one_ack_from_either_radio(ack_radio):
 
 @pytest.mark.asyncio
 async def test_ack_via_link_completes_send_when_local_tx_failed():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.local.fail = True
     router = _router_for(rig)
     crc = 0x0BADF00D
@@ -757,7 +771,7 @@ async def test_ack_via_link_completes_send_when_local_tx_failed():
 
 @pytest.mark.asyncio
 async def test_no_ack_wait_when_every_radio_failed():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.local.fail = rig.link.fail = True
     router = _router_for(rig)
 
@@ -777,7 +791,7 @@ async def test_no_ack_wait_when_every_radio_failed():
 
 @pytest.mark.asyncio
 async def test_ack_timeout_is_one_timeout_not_one_per_radio():
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
 
     with patch.object(rig.dispatcher, "wait_for_ack", wraps=rig.dispatcher.wait_for_ack) as wait:
@@ -797,7 +811,7 @@ async def test_ack_timeout_is_one_timeout_not_one_per_radio():
 @pytest.mark.asyncio
 async def test_ack_heard_during_the_second_radio_send_is_not_lost():
     """The reply can land before the single ACK wait starts; the dispatcher cache holds it."""
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     router = _router_for(rig)
     crc = 0x600DCAFE
 
@@ -821,7 +835,7 @@ async def test_early_ack_outlives_the_dispatcher_ack_cache_prune():
     The link wait (5 s default, up to 30 s) can outlast the dispatcher's 5 s
     cache of unclaimed ACKs, so the send's waiter must exist before the TX.
     """
-    rig = _Rig({"local_tx_mode": "all"})
+    rig = _Rig({"origin_tx": "all"})
     rig.handler.config["delays"]["local_tx_link_wait_seconds"] = 0.4
     rig.link.is_connected = False
     rig.link.is_degraded = True

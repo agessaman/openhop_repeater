@@ -440,7 +440,8 @@ identities:
 #   #   default: existing Fabric TX selection (default_radio / tx_mode)
 #   #   all:     transmit once on every Fabric radio, default_radio first
 #   #            (requires exactly two radios)
-#   local_tx_mode: default
+#   # Formerly local_tx_mode, which is still accepted.
+#   origin_tx: default
 #
 #   # Fan-out never runs MeshCore forwarding twice: each packet is validated,
 #   # deduplicated and path-updated once, then the same bytes are sent through
