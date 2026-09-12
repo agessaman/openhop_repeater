@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
 
@@ -30,6 +30,193 @@ AIRTIME_BUCKETS_QUERY = (
     "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, tx_radio_ids "
     "FROM packets WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC"
 )
+
+# Grouped on the attribution columns (all in idx_packets_airtime), so a week of
+# traffic comes back as a few rows per bucket rather than one per packet.
+RADIO_PACKET_RATES_QUERY = (
+    "SELECT CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts, rx_radio_id, transmitted, "
+    "tx_radio_id, tx_radio_ids, COUNT(*) AS n FROM packets "
+    "WHERE timestamp >= ? AND timestamp <= ? "
+    "GROUP BY bucket_ts, rx_radio_id, transmitted, tx_radio_id, tx_radio_ids"
+)
+
+# One pass for both the legacy packet_stats totals and the per-radio breakdown.
+# INDEXED BY for the same reason as the packet_types query in get_packet_stats.
+PACKET_STATS_BY_RADIO_QUERY = """
+    SELECT
+        rx_radio_id, transmitted, tx_radio_id, tx_radio_ids,
+        COUNT(*) AS n,
+        SUM(is_duplicate) AS duplicates,
+        SUM(rssi) AS rssi_sum, COUNT(rssi) AS rssi_n,
+        SUM(snr) AS snr_sum, COUNT(snr) AS snr_n,
+        SUM(score) AS score_sum, COUNT(score) AS score_n,
+        SUM(payload_length) AS payload_sum, COUNT(payload_length) AS payload_n,
+        SUM(tx_delay_ms) AS delay_sum, COUNT(tx_delay_ms) AS delay_n
+    FROM packets INDEXED BY idx_packets_timestamp
+    WHERE timestamp > ?
+    GROUP BY rx_radio_id, transmitted, tx_radio_id, tx_radio_ids
+"""
+
+ROUTE_NAMES = {0: "Transport Flood", 1: "Flood", 2: "Direct", 3: "Transport Direct"}
+
+
+def decode_tx_radio_ids(value) -> Optional[list]:
+    """Return a stored ``tx_radio_ids`` value as a list, or None when it holds none."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, list) else None
+
+
+def packet_carriers(transmitted, rx_radio_id, tx_radio_id, tx_radio_ids) -> Tuple[list, list]:
+    """Return ``(rx_ids, tx_ids)``: the stored radio ids one packet row occupied.
+
+    A forwarded row is a reception on its ingress radio (none when this node
+    originated the packet) plus one transmission per successful egress, falling
+    back to the scalar ``tx_radio_id`` for rows written before fan-out. Any other
+    row is a reception, duplicates included. Ids come back as stored; map them
+    onto the active radios with ``RadioResolver``.
+    """
+    if not transmitted:
+        return [rx_radio_id], []
+    rx_ids = [rx_radio_id] if rx_radio_id is not None else []
+    return rx_ids, decode_tx_radio_ids(tx_radio_ids) or [tx_radio_id]
+
+
+class RadioResolver:
+    """Map stored radio ids onto the active radios, in configured order.
+
+    With one radio every row belongs to it, which keeps pre-Fabric history (whose
+    radio id columns are NULL) attributed as before. With two or more, a missing
+    id, or one that is no longer configured, resolves to None and is counted as
+    unattributed rather than guessed onto the default radio.
+    """
+
+    def __init__(self, radio_profiles: Optional[list]):
+        order: list = []
+        for profile in radio_profiles or []:
+            if not isinstance(profile, dict):
+                continue
+            radio_id = str(profile.get("radio_id") or "radio0")
+            if radio_id not in order:
+                order.append(radio_id)
+        self.order = order or ["radio0"]
+        self.multi = len(self.order) > 1
+
+    def resolve(self, radio_id) -> Optional[str]:
+        if not self.multi:
+            return self.order[0]
+        if radio_id is None:
+            return None
+        radio_id = str(radio_id)
+        return radio_id if radio_id in self.order else None
+
+
+def route_totals(counts: dict) -> dict:
+    """Name per-route-type counts the way ``get_route_stats`` has always reported them."""
+    totals = {}
+    other = 0
+    for route_type, count in sorted(counts.items()):
+        if 0 <= route_type <= 3:
+            totals[ROUTE_NAMES[route_type]] = count
+        else:
+            other += count
+    if other > 0:
+        totals["Other Routes (>3)"] = other
+    return totals
+
+
+def _mean(total: float, count: int) -> Optional[float]:
+    return total / count if count else None
+
+
+def _packet_stats_by_radio(groups, resolver: RadioResolver) -> Tuple[dict, dict]:
+    """Fold ``PACKET_STATS_BY_RADIO_QUERY`` groups into legacy totals and per-radio stats.
+
+    The legacy totals keep their meaning: every row counts once, and a relay sent
+    on both radios is one transmitted packet. Per radio, ``transmissions`` counts
+    physical sends, so that relay is one transmission on each radio.
+    """
+    total = transmitted_total = 0
+    sums = {name: [0.0, 0] for name in ("rssi", "snr", "score", "payload", "delay")}
+    per_radio = {
+        radio_id: {
+            "radio_id": radio_id,
+            "received": 0,
+            "duplicates": 0,
+            "dropped": 0,
+            "transmissions": 0,
+            "rssi": [0.0, 0],
+            "snr": [0.0, 0],
+        }
+        for radio_id in resolver.order
+    }
+    unattributed_rx = unattributed_tx = 0
+
+    for row in groups:
+        n = int(row["n"])
+        transmitted = bool(row["transmitted"])
+        total += n
+        if transmitted:
+            transmitted_total += n
+        for name, pair in sums.items():
+            if row[f"{name}_n"]:
+                pair[0] += row[f"{name}_sum"]
+                pair[1] += row[f"{name}_n"]
+
+        rx_ids, tx_ids = packet_carriers(
+            transmitted, row["rx_radio_id"], row["tx_radio_id"], row["tx_radio_ids"]
+        )
+        for stored_id in rx_ids:
+            radio_id = resolver.resolve(stored_id)
+            if radio_id is None:
+                unattributed_rx += n
+                continue
+            entry = per_radio[radio_id]
+            entry["received"] += n
+            entry["duplicates"] += int(row["duplicates"] or 0)
+            if not transmitted:
+                entry["dropped"] += n
+            for name in ("rssi", "snr"):
+                if row[f"{name}_n"]:
+                    entry[name][0] += row[f"{name}_sum"]
+                    entry[name][1] += row[f"{name}_n"]
+        for stored_id in tx_ids:
+            radio_id = resolver.resolve(stored_id)
+            if radio_id is None:
+                unattributed_tx += n
+            else:
+                per_radio[radio_id]["transmissions"] += n
+
+    stats = {
+        # SUM() over an empty window is NULL; keep reporting it the same way.
+        "total_packets": total,
+        "transmitted_packets": transmitted_total if total else None,
+        "dropped_packets": total - transmitted_total if total else None,
+        "avg_rssi": _mean(*sums["rssi"]),
+        "avg_snr": _mean(*sums["snr"]),
+        "avg_score": _mean(*sums["score"]),
+        "avg_payload_length": _mean(*sums["payload"]),
+        "avg_tx_delay": _mean(*sums["delay"]),
+    }
+    radios = []
+    for radio_id in resolver.order:
+        entry = per_radio[radio_id]
+        rssi = _mean(*entry.pop("rssi"))
+        snr = _mean(*entry.pop("snr"))
+        entry["avg_rssi"] = None if rssi is None else round(rssi, 1)
+        entry["avg_snr"] = None if snr is None else round(snr, 1)
+        radios.append(entry)
+    return stats, {
+        "radios": radios,
+        "unattributed_rx_count": unattributed_rx,
+        "unattributed_tx_count": unattributed_tx,
+    }
 
 
 class SQLiteHandler:
@@ -1884,10 +2071,19 @@ class SQLiteHandler:
                 "packet_type_buckets": [],
             }
 
-    def get_packet_stats(self, hours: int = 24) -> dict:
+    def get_packet_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
+        """Packet counts and averages over the last ``hours``.
+
+        With two or more radio profiles the answer also carries ``radios``
+        (receptions, duplicates, drops and physical transmissions per radio) and
+        ``unattributed_rx_count`` / ``unattributed_tx_count``, computed in the same
+        pass as the totals. A single-radio node gets exactly the answer it had.
+        """
         try:
             now = time.time()
-            cached = self._packet_stats_cache.get(hours)
+            resolver = RadioResolver(radio_profiles)
+            cache_key = (hours, tuple(resolver.order) if resolver.multi else None)
+            cached = self._packet_stats_cache.get(cache_key)
             if cached and (now - cached["timestamp"]) < self._hot_cache_ttl_sec:
                 return cached["value"]
 
@@ -1896,22 +2092,27 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                stats = conn.execute(
-                    """
-                    SELECT
-                        COUNT(*) as total_packets,
-                        SUM(transmitted) as transmitted_packets,
-                        SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) as dropped_packets,
-                        AVG(rssi) as avg_rssi,
-                        AVG(snr) as avg_snr,
-                        AVG(score) as avg_score,
-                        AVG(payload_length) as avg_payload_length,
-                        AVG(tx_delay_ms) as avg_tx_delay
-                    FROM packets
-                    WHERE timestamp > ?
-                """,
-                    (cutoff,),
-                ).fetchone()
+                radio_stats = None
+                if resolver.multi:
+                    groups = conn.execute(PACKET_STATS_BY_RADIO_QUERY, (cutoff,)).fetchall()
+                    stats, radio_stats = _packet_stats_by_radio(groups, resolver)
+                else:
+                    stats = conn.execute(
+                        """
+                        SELECT
+                            COUNT(*) as total_packets,
+                            SUM(transmitted) as transmitted_packets,
+                            SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) as dropped_packets,
+                            AVG(rssi) as avg_rssi,
+                            AVG(snr) as avg_snr,
+                            AVG(score) as avg_score,
+                            AVG(payload_length) as avg_payload_length,
+                            AVG(tx_delay_ms) as avg_tx_delay
+                        FROM packets
+                        WHERE timestamp > ?
+                    """,
+                        (cutoff,),
+                    ).fetchone()
 
                 # INDEXED BY forces the timestamp range scan. Without it the
                 # planner picks idx_packets_type / idx_packets_transmitted to get
@@ -1956,8 +2157,10 @@ class SQLiteHandler:
                         for row in drop_reasons
                     ],
                 }
+                if radio_stats is not None:
+                    result.update(radio_stats)
 
-                self._packet_stats_cache[hours] = {"timestamp": now, "value": result}
+                self._packet_stats_cache[cache_key] = {"timestamp": now, "value": result}
                 return result
 
         except Exception as e:
@@ -2329,7 +2532,7 @@ class SQLiteHandler:
                     "preamble_length": int(preamble),
                 }
             ]
-        single_radio = len(profiles) == 1
+        resolver = RadioResolver(profiles)
 
         def _new_bucket(bucket_ts: int) -> dict:
             return {
@@ -2390,18 +2593,9 @@ class SQLiteHandler:
             unattributed_rx = 0
             unattributed_tx = 0
 
-            def _resolve(radio_id) -> Optional[str]:
-                """Map a stored radio id onto an active series, or None."""
-                if single_radio:
-                    return order[0]
-                if radio_id is None:
-                    return None
-                key = str(radio_id)
-                return key if key in series else None
-
             def _record(kind: str, radio_id, length, bucket_ts: int, total_bucket: dict) -> None:
                 nonlocal rx_total, tx_total, unattributed_rx, unattributed_tx
-                resolved = _resolve(radio_id)
+                resolved = resolver.resolve(radio_id)
                 ms = _airtime_ms(resolved, length) if resolved else 0.0
                 if resolved:
                     entry = series[resolved]
@@ -2429,29 +2623,13 @@ class SQLiteHandler:
                     total_bucket = totals[bucket_ts] = _new_bucket(bucket_ts)
                 length = row["length"]
 
-                tx_radio_ids = row["tx_radio_ids"]
-                if isinstance(tx_radio_ids, str):
-                    try:
-                        decoded = json.loads(tx_radio_ids)
-                    except ValueError:
-                        decoded = None
-                    tx_radio_ids = decoded if isinstance(decoded, list) else None
-
-                if row["transmitted"]:
-                    # A relayed packet is one row: it occupied the ingress radio
-                    # on the way in and every successful egress on the way out.
-                    # Locally originated packets have no ingress radio.
-                    if row["rx_radio_id"] is not None:
-                        _record("rx", row["rx_radio_id"], length, bucket_ts, total_bucket)
-                    if tx_radio_ids:
-                        for tx_radio_id in tx_radio_ids:
-                            _record("tx", tx_radio_id, length, bucket_ts, total_bucket)
-                    else:
-                        _record("tx", row["tx_radio_id"], length, bucket_ts, total_bucket)
-                else:
-                    # Receptions the repeater did not forward, duplicates included:
-                    # they consumed airtime on the radio that heard them.
-                    _record("rx", row["rx_radio_id"], length, bucket_ts, total_bucket)
+                rx_ids, tx_ids = packet_carriers(
+                    row["transmitted"], row["rx_radio_id"], row["tx_radio_id"], row["tx_radio_ids"]
+                )
+                for radio_id in rx_ids:
+                    _record("rx", radio_id, length, bucket_ts, total_bucket)
+                for radio_id in tx_ids:
+                    _record("tx", radio_id, length, bucket_ts, total_bucket)
 
             radios = []
             for radio_id in order:
@@ -2493,6 +2671,83 @@ class SQLiteHandler:
                 "unattributed_rx_count": 0,
                 "unattributed_tx_count": 0,
             }
+
+    def get_radio_packet_rates(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 3600,
+        radio_profiles: Optional[list] = None,
+    ) -> dict:
+        """Receptions and physical transmissions per radio per time bucket.
+
+        Counts follow ``get_airtime_buckets``'s attribution rules, but rows are
+        grouped in SQL on the attribution columns, so a week-long window costs a
+        few rows per bucket instead of one per packet and is read from
+        idx_packets_airtime alone.
+        """
+        resolver = RadioResolver(radio_profiles)
+        bucket_seconds = max(60, int(bucket_seconds))
+        empty = {
+            "bucket_seconds": bucket_seconds,
+            "radios": [],
+            "unattributed_rx_count": 0,
+            "unattributed_tx_count": 0,
+        }
+        series = {
+            radio_id: {"buckets": {}, "rx_total": 0, "tx_total": 0} for radio_id in resolver.order
+        }
+        unattributed = {"rx": 0, "tx": 0}
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    RADIO_PACKET_RATES_QUERY,
+                    (bucket_seconds, bucket_seconds, start_timestamp, end_timestamp),
+                ).fetchall()
+
+            for row in rows:
+                n = int(row["n"])
+                bucket_ts = int(row["bucket_ts"])
+                rx_ids, tx_ids = packet_carriers(
+                    row["transmitted"], row["rx_radio_id"], row["tx_radio_id"], row["tx_radio_ids"]
+                )
+                for kind, stored_ids in (("rx", rx_ids), ("tx", tx_ids)):
+                    for stored_id in stored_ids:
+                        radio_id = resolver.resolve(stored_id)
+                        if radio_id is None:
+                            unattributed[kind] += n
+                            continue
+                        entry = series[radio_id]
+                        bucket = entry["buckets"].get(bucket_ts)
+                        if bucket is None:
+                            bucket = entry["buckets"][bucket_ts] = {
+                                "timestamp": bucket_ts,
+                                "rx_count": 0,
+                                "tx_count": 0,
+                            }
+                        bucket[kind + "_count"] += n
+                        entry[kind + "_total"] += n
+
+            return {
+                "bucket_seconds": bucket_seconds,
+                "radios": [
+                    {
+                        "radio_id": radio_id,
+                        "buckets": sorted(
+                            series[radio_id]["buckets"].values(), key=lambda b: b["timestamp"]
+                        ),
+                        "rx_total": series[radio_id]["rx_total"],
+                        "tx_total": series[radio_id]["tx_total"],
+                    }
+                    for radio_id in resolver.order
+                ],
+                "unattributed_rx_count": unattributed["rx"],
+                "unattributed_tx_count": unattributed["tx"],
+            }
+        except Exception as e:
+            logger.error(f"Failed to get radio packet rates: {e}")
+            return empty
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
         try:
@@ -2558,8 +2813,15 @@ class SQLiteHandler:
         hours: int = 24,
         limit: int = 1000,
         bucket_seconds: Optional[int] = None,
+        radio_id: Optional[str] = None,
+        by_radio: bool = False,
     ) -> list:
-        """Observations of one peer, oldest first; ``bucket_seconds`` summarises them instead."""
+        """Observations of one peer, oldest first; ``bucket_seconds`` summarises them instead.
+
+        ``radio_id`` keeps only what that radio heard. Rows carry ``rx_radio_id``
+        when the reception has one. ``by_radio`` splits each bucket per receiving
+        radio, adding ``radio_id`` to every bucket.
+        """
         try:
             normalized_hash = str(peer_hash or "").strip().upper()
             if not normalized_hash:
@@ -2569,14 +2831,26 @@ class SQLiteHandler:
             hours = max(1, int(hours))
             limit = max(1, min(int(limit), 5000))
             cutoff = time.time() - (hours * 3600)
+            radio_id = str(radio_id) if radio_id else None
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 if bucket_seconds is not None:
                     return self._bucket_neighbor_link_history(
-                        conn, normalized_hash, path_hash_size, cutoff, int(bucket_seconds), limit
+                        conn,
+                        normalized_hash,
+                        path_hash_size,
+                        cutoff,
+                        int(bucket_seconds),
+                        limit,
+                        radio_id=radio_id,
+                        by_radio=by_radio,
                     )
 
+                params = [normalized_hash, path_hash_size, cutoff]
+                if radio_id:
+                    params.append(radio_id)
+                params.append(limit)
                 rows = conn.execute(
                     """
                     SELECT
@@ -2588,15 +2862,19 @@ class SQLiteHandler:
                         packet_hash,
                         type,
                         route,
-                        original_path
+                        original_path,
+                        rx_radio_id
                     FROM packets INDEXED BY idx_packets_upstream_time
                     WHERE upstream_hash = ?
                       AND upstream_hash_size = ?
                       AND timestamp >= ?
+                    """
+                    + ("  AND rx_radio_id = ?\n" if radio_id else "")
+                    + """
                     ORDER BY timestamp DESC
                     LIMIT ?
                     """,
-                    (normalized_hash, path_hash_size, cutoff, limit),
+                    params,
                 ).fetchall()
 
                 history = []
@@ -2611,19 +2889,20 @@ class SQLiteHandler:
                         except Exception:
                             hop_count = None
 
-                    history.append(
-                        {
-                            "timestamp": row["timestamp"],
-                            "rssi": row["rssi"],
-                            "snr": row["snr"],
-                            "score": row["score"],
-                            "is_duplicate": bool(row["is_duplicate"]),
-                            "packet_hash": row["packet_hash"],
-                            "packet_type": row["type"],
-                            "route_type": row["route"],
-                            "path_hop_count": hop_count,
-                        }
-                    )
+                    entry = {
+                        "timestamp": row["timestamp"],
+                        "rssi": row["rssi"],
+                        "snr": row["snr"],
+                        "score": row["score"],
+                        "is_duplicate": bool(row["is_duplicate"]),
+                        "packet_hash": row["packet_hash"],
+                        "packet_type": row["type"],
+                        "route_type": row["route"],
+                        "path_hop_count": hop_count,
+                    }
+                    if row["rx_radio_id"] is not None:
+                        entry["rx_radio_id"] = row["rx_radio_id"]
+                    history.append(entry)
 
                 history.reverse()
                 return history
@@ -2639,12 +2918,22 @@ class SQLiteHandler:
         cutoff: float,
         bucket_seconds: int,
         limit: int,
+        *,
+        radio_id: Optional[str] = None,
+        by_radio: bool = False,
     ) -> list:
         bucket_seconds = max(1, bucket_seconds)
+        params = [bucket_seconds, bucket_seconds, peer_hash, path_hash_size, cutoff]
+        if radio_id:
+            params.append(radio_id)
+        params.append(limit)
         rows = conn.execute(
             """
             SELECT
                 CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+            """
+            + ("    rx_radio_id,\n" if by_radio else "")
+            + """
                 COUNT(*) AS n,
                 SUM(is_duplicate) AS dup,
                 MAX(timestamp) AS last_ts,
@@ -2655,18 +2944,23 @@ class SQLiteHandler:
             WHERE upstream_hash = ?
               AND upstream_hash_size = ?
               AND timestamp >= ?
-            GROUP BY bucket_ts
-            ORDER BY bucket_ts DESC
-            LIMIT ?
-            """,
-            (bucket_seconds, bucket_seconds, peer_hash, path_hash_size, cutoff, limit),
+            """
+            + ("  AND rx_radio_id = ?\n" if radio_id else "")
+            + (
+                "GROUP BY bucket_ts, rx_radio_id ORDER BY bucket_ts DESC, rx_radio_id DESC\n"
+                if by_radio
+                else "GROUP BY bucket_ts ORDER BY bucket_ts DESC\n"
+            )
+            + "LIMIT ?",
+            params,
         ).fetchall()
 
         def mean(value):
             return None if value is None else round(value, 3)
 
-        return [
-            {
+        buckets = []
+        for row in reversed(rows):
+            bucket = {
                 "timestamp": int(row["bucket_ts"]),
                 "last_ts": row["last_ts"],
                 "n": int(row["n"]),
@@ -2675,8 +2969,10 @@ class SQLiteHandler:
                 "rssi": mean(row["rssi"]),
                 "snr": mean(row["snr"]),
             }
-            for row in reversed(rows)
-        ]
+            if by_radio:
+                bucket["radio_id"] = row["rx_radio_id"]
+            buckets.append(bucket)
+        return buckets
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
         try:
@@ -2776,47 +3072,93 @@ class SQLiteHandler:
             logger.error(f"Failed to get packet type stats from SQLite: {e}")
             return {"error": str(e), "data_source": "error"}
 
-    def get_route_stats(self, hours: int = 24) -> dict:
+    def get_route_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
+        """Packet counts per route type over the last ``hours``.
 
+        With two or more radio profiles the answer also carries ``radios`` (the
+        route mix of each radio's receptions), ``originated`` (packets this node
+        sent itself, which no radio received) and ``unattributed_count``.
+        """
         try:
             cutoff = time.time() - (hours * 3600)
+            resolver = RadioResolver(radio_profiles)
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                route_rows = conn.execute(
-                    """
-                    SELECT route, COUNT(*) as count
-                    FROM packets
-                    WHERE timestamp > ?
-                    GROUP BY route
-                """,
-                    (cutoff,),
-                ).fetchall()
+                if not resolver.multi:
+                    route_rows = conn.execute(
+                        """
+                        SELECT route, COUNT(*) as count
+                        FROM packets
+                        WHERE timestamp > ?
+                        GROUP BY route
+                    """,
+                        (cutoff,),
+                    ).fetchall()
+                    grouped = [
+                        (int(row["route"]), None, None, int(row["count"])) for row in route_rows
+                    ]
+                else:
+                    route_rows = conn.execute(
+                        """
+                        SELECT route, rx_radio_id, transmitted, COUNT(*) as count
+                        FROM packets INDEXED BY idx_packets_timestamp
+                        WHERE timestamp > ?
+                        GROUP BY route, rx_radio_id, transmitted
+                    """,
+                        (cutoff,),
+                    ).fetchall()
+                    grouped = [
+                        (
+                            int(row["route"]),
+                            row["rx_radio_id"],
+                            row["transmitted"],
+                            int(row["count"]),
+                        )
+                        for row in route_rows
+                    ]
 
-                route_counts = {}
-                route_names = {0: "Transport Flood", 1: "Flood", 2: "Direct", 3: "Transport Direct"}
-                other_count = 0
+            counts: dict = {}
+            per_radio: dict = {radio_id: {} for radio_id in resolver.order}
+            originated: dict = {}
+            unattributed = 0
+            for route_type, rx_radio_id, transmitted, count in grouped:
+                counts[route_type] = counts.get(route_type, 0) + count
+                if not resolver.multi:
+                    continue
+                if transmitted and rx_radio_id is None:
+                    originated[route_type] = originated.get(route_type, 0) + count
+                    continue
+                radio_id = resolver.resolve(rx_radio_id)
+                if radio_id is None:
+                    unattributed += count
+                    continue
+                per_radio[radio_id][route_type] = per_radio[radio_id].get(route_type, 0) + count
 
-                for row in route_rows:
-                    route_type = int(row["route"])
-                    count = int(row["count"])
-                    if route_type <= 3:
-                        route_name = route_names.get(route_type, f"Route {route_type}")
-                        route_counts[route_name] = count
-                    else:
-                        other_count += count
-
-                if other_count > 0:
-                    route_counts["Other Routes (>3)"] = other_count
-
-                return {
-                    "hours": hours,
-                    "route_totals": route_counts,
-                    "total_packets": sum(route_counts.values()),
-                    "period": f"{hours} hours",
-                    "data_source": "sqlite",
+            route_counts = route_totals(counts)
+            result = {
+                "hours": hours,
+                "route_totals": route_counts,
+                "total_packets": sum(route_counts.values()),
+                "period": f"{hours} hours",
+                "data_source": "sqlite",
+            }
+            if resolver.multi:
+                result["radios"] = [
+                    {
+                        "radio_id": radio_id,
+                        "route_totals": route_totals(per_radio[radio_id]),
+                        "total_packets": sum(per_radio[radio_id].values()),
+                    }
+                    for radio_id in resolver.order
+                ]
+                result["originated"] = {
+                    "route_totals": route_totals(originated),
+                    "total_packets": sum(originated.values()),
                 }
+                result["unattributed_count"] = unattributed
+            return result
 
         except Exception as e:
             logger.error(f"Failed to get route stats from SQLite: {e}")

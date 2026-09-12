@@ -3871,7 +3871,9 @@ class APIEndpoints:
     def packet_stats(self, hours=24):
         try:
             hours = int(hours)
-            stats = self._get_storage().get_packet_stats(hours=hours)
+            stats = self._get_storage().get_packet_stats(
+                hours=hours, radio_profiles=self._active_radio_profiles()
+            )
             return self._success(stats)
         except Exception as e:
             logger.error(f"Error getting packet stats: {e}")
@@ -3893,7 +3895,9 @@ class APIEndpoints:
     def route_stats(self, hours=24):
         try:
             hours = int(hours)
-            stats = self._get_storage().get_route_stats(hours=hours)
+            stats = self._get_storage().get_route_stats(
+                hours=hours, radio_profiles=self._active_radio_profiles()
+            )
             return self._success(stats)
         except Exception as e:
             logger.error(f"Error getting route stats: {e}")
@@ -3915,7 +3919,8 @@ class APIEndpoints:
             if row_limit < 1:
                 raise ValueError("limit must be >= 1")
 
-            links = tracker.snapshot(active_within_seconds=active_window)
+            radio_ids = [profile.get("radio_id") for profile in self._active_radio_profiles()]
+            links = tracker.snapshot(active_within_seconds=active_window, radio_ids=radio_ids)
             links = links[:row_limit]
             return self._success(
                 {
@@ -3934,7 +3939,14 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def neighbor_link_history(
-        self, peer_hash=None, path_hash_size=None, hours=24, limit=1000, bucket_seconds=None
+        self,
+        peer_hash=None,
+        path_hash_size=None,
+        hours=24,
+        limit=1000,
+        bucket_seconds=None,
+        radio_id=None,
+        by_radio=None,
     ):
         try:
             if not peer_hash:
@@ -3946,6 +3958,8 @@ class APIEndpoints:
             window_hours = int(hours)
             row_limit = int(limit)
             bucket_s = max(60, int(bucket_seconds)) if bucket_seconds is not None else None
+            radio = str(radio_id).strip() if radio_id else None
+            split = str(by_radio).strip().lower() in ("1", "true", "yes") if by_radio else False
 
             rows = self._get_storage().get_neighbor_link_history(
                 peer_hash=str(peer_hash),
@@ -3953,6 +3967,8 @@ class APIEndpoints:
                 hours=window_hours,
                 limit=row_limit,
                 bucket_seconds=bucket_s,
+                radio_id=radio,
+                by_radio=split,
             )
             data = {
                 "peer_hash": str(peer_hash).upper(),
@@ -3961,9 +3977,13 @@ class APIEndpoints:
                 "limit": row_limit,
                 "count": len(rows),
             }
+            if radio:
+                data["radio_id"] = radio
             if bucket_s is not None:
                 data["bucket_seconds"] = bucket_s
                 data["buckets"] = rows
+                if split:
+                    data["by_radio"] = True
             else:
                 data["rows"] = rows
             return self._success(data)
@@ -4148,6 +4168,33 @@ class APIEndpoints:
             return self._success(result)
         except Exception as e:
             logger.error(f"Error getting airtime chart data: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def radio_packet_rates(self, hours=24, bucket_seconds=None):
+        """Receptions and transmissions per radio per bucket, for per-radio rate charts.
+
+        A relay sent on both radios of a bridge counts as a transmission on each.
+        """
+        try:
+            window_hours = max(1, min(int(hours), 168))
+            if bucket_seconds is None:
+                bucket_s = 300 if window_hours <= 6 else 3600
+            else:
+                bucket_s = max(60, min(int(bucket_seconds), 86400))
+            end_ts = time.time()
+            result = self._get_storage().get_radio_packet_rates(
+                start_timestamp=end_ts - window_hours * 3600,
+                end_timestamp=end_ts,
+                bucket_seconds=bucket_s,
+                radio_profiles=self._active_radio_profiles(),
+            )
+            return self._success(dict(result, hours=window_hours))
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting radio packet rates: {e}")
             return self._error(e)
 
     @cherrypy.expose
