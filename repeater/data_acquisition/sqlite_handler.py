@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
+
 logger = logging.getLogger("SQLiteHandler")
 
 
@@ -2245,67 +2247,206 @@ class SQLiteHandler:
         bw_hz: int = 62500,
         cr: int = 5,
         preamble: int = 17,
-    ) -> list:
+        radio_profiles: Optional[list] = None,
+    ) -> dict:
         """Return pre-aggregated airtime buckets for chart rendering.
 
-        Applies the Semtech LoRa airtime formula server-side and groups results
-        into time buckets, drastically reducing response size vs raw packet rows.
+        Applies the shared core LoRa time-on-air estimator server-side and groups
+        results into time buckets, drastically reducing response size vs raw
+        packet rows.
+
+        ``radio_profiles`` is the ordered list of active radio air settings (see
+        ``build_radio_profiles``). Each stored packet is attributed to the radios
+        that actually carried it: its ingress ``rx_radio_id`` and every successful
+        egress in ``tx_radio_ids``, so a relayed packet is charged to both sides of
+        a Fabric bridge at that side's own SF. With a single profile every packet
+        belongs to that radio, which keeps pre-Fabric databases (whose radio id
+        columns are NULL) attributed exactly as before. With two or more, a packet
+        whose radio cannot be identified is counted as unattributed rather than
+        guessed onto the default radio.
+
+        The legacy top-level ``buckets``/``rx_total``/``tx_total`` fields remain,
+        carrying the sum across radios for UI builds that predate ``radios``.
         """
-        import math
+        profiles = [p for p in (radio_profiles or []) if isinstance(p, dict)]
+        if not profiles:
+            profiles = [
+                {
+                    "radio_id": "radio0",
+                    "frequency_hz": None,
+                    "bandwidth_hz": int(bw_hz),
+                    "spreading_factor": int(sf),
+                    "coding_rate": int(cr),
+                    "preamble_length": int(preamble),
+                }
+            ]
+        single_radio = len(profiles) == 1
 
-        bw_khz = bw_hz / 1000
-        t_sym = (2**sf) / bw_khz  # ms per symbol
-        t_preamble = (preamble + 4.25) * t_sym
-        de = 1 if sf >= 11 and bw_hz <= 125000 else 0
+        def _new_bucket(bucket_ts: int) -> dict:
+            return {
+                "timestamp": bucket_ts,
+                "rx_ms": 0.0,
+                "tx_ms": 0.0,
+                "rx_count": 0,
+                "tx_count": 0,
+            }
 
-        def _airtime_ms(length_bytes: int) -> float:
-            length_bytes = max(length_bytes or 32, 1)
-            numerator = max(8 * length_bytes - 4 * sf + 28 + 16, 0)  # CRC=1, H=0
-            denominator = 4 * (sf - 2 * de)
-            n_payload = 8 + math.ceil(numerator / denominator) * cr
-            return t_preamble + n_payload * t_sym
+        # One accumulator per radio, plus the combined legacy series. Airtime is
+        # memoised per (radio, length) because a 24 h window is thousands of rows
+        # over a handful of distinct packet lengths.
+        series: dict = {}
+        order: list = []
+        for profile in profiles:
+            radio_id = str(profile.get("radio_id") or "radio0")
+            if radio_id in series:
+                continue
+            order.append(radio_id)
+            fields = (
+                profile.get("spreading_factor"),
+                profile.get("bandwidth_hz"),
+                profile.get("coding_rate"),
+                profile.get("preamble_length"),
+            )
+            series[radio_id] = {
+                "profile": profile,
+                "params": fields if all(f is not None for f in fields) else None,
+                "buckets": {},
+                "rx_total": 0,
+                "tx_total": 0,
+                "cache": {},
+            }
+
+        def _airtime_ms(radio_id: str, length_bytes) -> float:
+            entry = series[radio_id]
+            if entry["params"] is None:
+                return 0.0
+            length = max(int(length_bytes or 32), 1)
+            cached = entry["cache"].get(length)
+            if cached is None:
+                sf_v, bw_v, cr_v, preamble_v = entry["params"]
+                cached = calculate_lora_airtime_ms(length, sf_v, bw_v, cr_v, preamble_v)
+                entry["cache"][length] = cached
+            return cached
 
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT timestamp, length, transmitted FROM packets "
+                    "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, "
+                    "tx_radio_ids FROM packets "
                     "WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
                     (start_timestamp, end_timestamp),
                 ).fetchall()
 
-            buckets: dict = {}
+            totals: dict = {}
             rx_total = 0
             tx_total = 0
+            unattributed_rx = 0
+            unattributed_tx = 0
+
+            def _resolve(radio_id) -> Optional[str]:
+                """Map a stored radio id onto an active series, or None."""
+                if single_radio:
+                    return order[0]
+                if radio_id is None:
+                    return None
+                key = str(radio_id)
+                return key if key in series else None
+
+            def _record(kind: str, radio_id, length, bucket_ts: int, total_bucket: dict) -> None:
+                nonlocal rx_total, tx_total, unattributed_rx, unattributed_tx
+                resolved = _resolve(radio_id)
+                ms = _airtime_ms(resolved, length) if resolved else 0.0
+                if resolved:
+                    entry = series[resolved]
+                    bucket = entry["buckets"].get(bucket_ts)
+                    if bucket is None:
+                        bucket = entry["buckets"][bucket_ts] = _new_bucket(bucket_ts)
+                    bucket[kind + "_ms"] += ms
+                    bucket[kind + "_count"] += 1
+                    entry[kind + "_total"] += 1
+                elif kind == "rx":
+                    unattributed_rx += 1
+                else:
+                    unattributed_tx += 1
+                total_bucket[kind + "_ms"] += ms
+                total_bucket[kind + "_count"] += 1
+                if kind == "rx":
+                    rx_total += 1
+                else:
+                    tx_total += 1
+
             for row in rows:
                 bucket_ts = int(row["timestamp"] / bucket_seconds) * bucket_seconds
-                ms = _airtime_ms(row["length"])
-                if bucket_ts not in buckets:
-                    buckets[bucket_ts] = {
-                        "timestamp": bucket_ts,
-                        "rx_ms": 0.0,
-                        "tx_ms": 0.0,
-                        "rx_count": 0,
-                        "tx_count": 0,
-                    }
+                total_bucket = totals.get(bucket_ts)
+                if total_bucket is None:
+                    total_bucket = totals[bucket_ts] = _new_bucket(bucket_ts)
+                length = row["length"]
+
+                tx_radio_ids = row["tx_radio_ids"]
+                if isinstance(tx_radio_ids, str):
+                    try:
+                        decoded = json.loads(tx_radio_ids)
+                    except ValueError:
+                        decoded = None
+                    tx_radio_ids = decoded if isinstance(decoded, list) else None
+
                 if row["transmitted"]:
-                    buckets[bucket_ts]["tx_ms"] += ms
-                    buckets[bucket_ts]["tx_count"] += 1
-                    tx_total += 1
+                    # A relayed packet is one row: it occupied the ingress radio
+                    # on the way in and every successful egress on the way out.
+                    # Locally originated packets have no ingress radio.
+                    if row["rx_radio_id"] is not None:
+                        _record("rx", row["rx_radio_id"], length, bucket_ts, total_bucket)
+                    if tx_radio_ids:
+                        for tx_radio_id in tx_radio_ids:
+                            _record("tx", tx_radio_id, length, bucket_ts, total_bucket)
+                    else:
+                        _record("tx", row["tx_radio_id"], length, bucket_ts, total_bucket)
                 else:
-                    buckets[bucket_ts]["rx_ms"] += ms
-                    buckets[bucket_ts]["rx_count"] += 1
-                    rx_total += 1
+                    # Receptions the repeater did not forward, duplicates included:
+                    # they consumed airtime on the radio that heard them.
+                    _record("rx", row["rx_radio_id"], length, bucket_ts, total_bucket)
+
+            radios = []
+            for radio_id in order:
+                entry = series[radio_id]
+                profile = entry["profile"]
+                radios.append(
+                    {
+                        "radio_id": radio_id,
+                        "profile": {
+                            "frequency_hz": profile.get("frequency_hz"),
+                            "bandwidth_hz": profile.get("bandwidth_hz"),
+                            "spreading_factor": profile.get("spreading_factor"),
+                            "coding_rate": profile.get("coding_rate"),
+                            "preamble_length": profile.get("preamble_length"),
+                        },
+                        "buckets": sorted(entry["buckets"].values(), key=lambda b: b["timestamp"]),
+                        "rx_total": entry["rx_total"],
+                        "tx_total": entry["tx_total"],
+                    }
+                )
 
             return {
-                "buckets": sorted(buckets.values(), key=lambda x: x["timestamp"]),
+                "buckets": sorted(totals.values(), key=lambda b: b["timestamp"]),
                 "bucket_seconds": bucket_seconds,
                 "rx_total": rx_total,
                 "tx_total": tx_total,
+                "radios": radios,
+                "unattributed_rx_count": unattributed_rx,
+                "unattributed_tx_count": unattributed_tx,
             }
         except Exception as e:
             logger.error(f"Failed to get airtime buckets: {e}")
-            return {"buckets": [], "bucket_seconds": bucket_seconds, "rx_total": 0, "tx_total": 0}
+            return {
+                "buckets": [],
+                "bucket_seconds": bucket_seconds,
+                "rx_total": 0,
+                "tx_total": 0,
+                "radios": [],
+                "unattributed_rx_count": 0,
+                "unattributed_tx_count": 0,
+            }
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
         try:

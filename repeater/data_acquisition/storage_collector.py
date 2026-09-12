@@ -484,9 +484,17 @@ class StorageCollector:
         bw_hz: int = 62500,
         cr: int = 5,
         preamble: int = 17,
+        radio_profiles: Optional[list] = None,
     ) -> dict:
         return self.sqlite_handler.get_airtime_buckets(
-            start_timestamp, end_timestamp, bucket_seconds, sf, bw_hz, cr, preamble
+            start_timestamp,
+            end_timestamp,
+            bucket_seconds,
+            sf,
+            bw_hz,
+            cr,
+            preamble,
+            radio_profiles=radio_profiles,
         )
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:

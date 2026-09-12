@@ -1851,6 +1851,9 @@ class APIEndpoints:
             if daemon is not None:
                 meta = getattr(daemon, "radio_stack_meta", None) or {}
             stats["radio_stack"] = meta
+            # Authoritative per-radio air settings, so clients never have to infer
+            # which profile applies to which radio of a Fabric.
+            stats["radio_profiles"] = self._active_radio_profiles()
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
@@ -4080,6 +4083,28 @@ class APIEndpoints:
             logger.error(f"Error getting airtime data: {e}")
             return self._error(e)
 
+    def _active_radio_profiles(self) -> list:
+        """Air settings of the radios currently on the air, in configured order.
+
+        Rebuilt from the live config rather than read from the boot-time
+        ``radio_stack_meta`` snapshot, so a live radio reconfiguration is
+        reflected without a restart. Falls back to the daemon's snapshot if the
+        config cannot be read.
+        """
+        try:
+            from repeater.config import build_radio_profiles
+
+            profiles = build_radio_profiles(self.config)
+            if profiles:
+                return profiles
+        except Exception as e:
+            logger.warning(f"Could not derive radio profiles from config: {e}")
+
+        daemon = getattr(self, "daemon_instance", None)
+        meta = getattr(daemon, "radio_stack_meta", None) or {} if daemon is not None else {}
+        snapshot = meta.get("radio_profiles")
+        return list(snapshot) if isinstance(snapshot, list) else []
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def airtime_chart_data(
@@ -4095,7 +4120,15 @@ class APIEndpoints:
         """Server-side aggregated airtime utilization for chart rendering.
 
         Returns pre-bucketed rx_ms/tx_ms per time bucket instead of raw packet rows,
-        reducing response size from potentially hundreds of KB to a few KB.
+        reducing response size from potentially hundreds of KB to a few KB. The
+        response carries one series per active radio under ``radios`` alongside the
+        legacy combined fields.
+
+        The server's own radio configuration decides which profile each radio's
+        airtime is computed with; a two-radio Fabric must never have one
+        caller-supplied profile applied to both sides. The ``sf``/``bw_hz``/``cr``/
+        ``preamble`` query parameters are kept only as a fallback for callers
+        talking to a configuration this server cannot read profiles from.
         """
         try:
             now = __import__("time").time()
@@ -4110,6 +4143,7 @@ class APIEndpoints:
                 bw_hz=int(bw_hz),
                 cr=int(cr),
                 preamble=int(preamble),
+                radio_profiles=self._active_radio_profiles(),
             )
             return self._success(result)
         except Exception as e:

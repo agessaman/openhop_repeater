@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, overload
 import yaml
 
 from repeater.exceptions import ConfigurationError
-from repeater.modem_config import normalize_modem_config
+from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
@@ -895,6 +895,128 @@ def _validate_fabric_fanout(fabric_cfg, tx_mode: str, radio_count: int) -> tuple
     return repeat_on_ingress, local_tx_mode
 
 
+# Air-setting defaults per radio_type, mirroring ``get_radio_for_board``. The
+# SX1262 paths require every field in the config, so their entries only matter
+# for a malformed config that never reaches hardware.
+_RADIO_AIR_DEFAULTS = {
+    "sx1262": {"preamble_length": 16},
+    "sx1262_ch341": {"preamble_length": 16},
+    "kiss": {"preamble_length": 32},
+    "modem_tcp": {"preamble_length": 16},
+    "modem_usb": {"preamble_length": 16},
+}
+_RADIO_AIR_COMMON_DEFAULTS = {
+    "frequency": 869618000,
+    "bandwidth": 62500,
+    "spreading_factor": 8,
+    "coding_rate": 8,
+}
+
+
+def _radio_air_profile(board_config: dict, radio_id: str) -> Optional[dict]:
+    """Effective LoRa air settings for one built radio, or None when disabled.
+
+    Mirrors the field reads in ``get_radio_for_board`` so the reported profile
+    is the one the hardware was actually configured with. Reporting-only: a
+    field that cannot be read as an integer is returned as ``None`` rather than
+    guessed, so the UI can say the profile is unavailable instead of drawing a
+    chart from a default that was never on the air.
+    """
+    radio_type_raw = board_config.get("radio_type")
+    radio_type = "none" if radio_type_raw is None else str(radio_type_raw).lower().strip()
+    if radio_type in ("", "none", "null", "disabled", "off", "no_radio"):
+        return None
+    if radio_type == "kiss-modem":
+        radio_type = "kiss"
+    radio_type = LEGACY_MODEM_RADIO_TYPES.get(radio_type, radio_type)
+
+    if radio_type not in _RADIO_AIR_DEFAULTS:
+        # get_radio_for_board rejects this type, so no hardware was built from
+        # it. Reporting a default-backed profile would describe a radio that is
+        # not on the air.
+        logger.warning(
+            "No airtime profile for radio %s: unsupported radio_type=%r", radio_id, radio_type_raw
+        )
+        return None
+
+    radio_cfg = board_config.get("radio")
+    if not isinstance(radio_cfg, dict):
+        radio_cfg = {}
+    defaults = dict(_RADIO_AIR_COMMON_DEFAULTS)
+    defaults.update(_RADIO_AIR_DEFAULTS[radio_type])
+
+    def _field(name: str) -> Optional[int]:
+        value = radio_cfg.get(name, defaults.get(name))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "radio %s: unreadable %s=%r; reporting profile field as unknown",
+                radio_id,
+                name,
+                value,
+            )
+            return None
+
+    return {
+        "radio_id": str(radio_id),
+        "radio_type": radio_type,
+        "frequency_hz": _field("frequency"),
+        "bandwidth_hz": _field("bandwidth"),
+        "spreading_factor": _field("spreading_factor"),
+        "coding_rate": _field("coding_rate"),
+        "preamble_length": _field("preamble_length"),
+    }
+
+
+def build_radio_profiles(config: dict) -> list:
+    """Report the air settings of every configured radio, in configured order.
+
+    Uses the same id and inheritance rules as ``build_radio_stack`` so the
+    profiles line up one-for-one with the radios it builds, without touching
+    hardware. Callers that need current settings (the airtime endpoint) can
+    rebuild from the live config dict rather than reading a boot snapshot.
+    """
+    if not isinstance(config, dict):
+        return []
+
+    try:
+        normalized = normalize_modem_config(config, warn=False)
+    except Exception:  # pragma: no cover - normalisation is defensive here
+        normalized = config
+
+    radios_cfg = normalized.get("radios")
+    fabric_cfg = normalized.get("fabric") if isinstance(normalized.get("fabric"), dict) else {}
+    default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
+
+    profiles = []
+    if isinstance(radios_cfg, list) and len(radios_cfg) > 0:
+        for entry in radios_cfg:
+            try:
+                merged = _merge_radio_entry(normalized, entry)
+            except ValueError as exc:
+                logger.warning("Cannot profile radios[] entry: %s", exc)
+                continue
+            profile = _radio_air_profile(merged, merged["_radio_id"])
+            if profile is not None:
+                profiles.append(profile)
+        if len(profiles) != len(radios_cfg):
+            # A partial list would read as a smaller Fabric, and a one-element
+            # list would claim every packet belongs to that radio. Report
+            # nothing instead and let the caller fall back to what was built.
+            logger.warning(
+                "Profiled %d of %d configured radios; reporting no profiles",
+                len(profiles),
+                len(radios_cfg),
+            )
+            return []
+        return profiles
+
+    rid = str(default_radio) if (default_radio and fabric_cfg.get("use_fabric")) else "radio0"
+    profile = _radio_air_profile(normalized, rid)
+    return [profile] if profile is not None else []
+
+
 def build_radio_stack(config: dict):
     """Build single- or multi-radio stack for the repeater.
 
@@ -923,6 +1045,10 @@ def build_radio_stack(config: dict):
         "repeat_on_ingress": repeat_on_ingress,
         "local_tx_mode": local_tx_mode,
         "fabric": False,
+        # Air settings per built radio, in configured order. Reporting consumers
+        # (airtime attribution, /stats) read these instead of assuming the
+        # top-level ``radio`` section applies to every radio in a Fabric.
+        "radio_profiles": [],
     }
 
     if isinstance(radios_cfg, list) and len(radios_cfg) > 0:
@@ -935,11 +1061,15 @@ def build_radio_stack(config: dict):
             ) from exc
 
         pairs = []
+        profiles = []
         for entry in radios_cfg:
             merged = _merge_radio_entry(config, entry)
             rid = merged.pop("_radio_id")
             physical = get_radio_for_board(merged)
             pairs.append((physical, rid))
+            profile = _radio_air_profile(merged, rid)
+            if profile is not None:
+                profiles.append(profile)
 
         default_id = str(default_radio) if default_radio else pairs[0][1]
         radio = FabricRadio(radios=pairs, default_radio_id=default_id)
@@ -951,6 +1081,7 @@ def build_radio_stack(config: dict):
                 "radio_ids": [rid for _, rid in pairs],
                 "default_radio": default_id,
                 "fabric": True,
+                "radio_profiles": profiles,
             }
         )
         return radio, meta
@@ -958,6 +1089,8 @@ def build_radio_stack(config: dict):
     physical = get_radio_for_board(config)
     meta["radio_ids"] = ["radio0"]
     meta["default_radio"] = "radio0"
+    single_profile = _radio_air_profile(normalize_modem_config(config, warn=False), "radio0")
+    meta["radio_profiles"] = [single_profile] if single_profile is not None else []
 
     if use_fabric:
         try:
@@ -969,12 +1102,15 @@ def build_radio_stack(config: dict):
         rid = str(default_radio or "radio0")
         radio = FabricRadio(radio=physical, radio_id=rid, default_radio_id=rid)
         _apply_fabric_tx_mode(radio.fabric, tx_mode)
+        if single_profile is not None:
+            single_profile = dict(single_profile, radio_id=rid)
         meta.update(
             {
                 "mode": "single_fabric",
                 "radio_ids": [rid],
                 "default_radio": rid,
                 "fabric": True,
+                "radio_profiles": [single_profile] if single_profile is not None else [],
             }
         )
         return radio, meta
