@@ -13,7 +13,7 @@ import pytest
 from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
 
 from repeater.config import build_radio_profiles
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.data_acquisition.sqlite_handler import AIRTIME_BUCKETS_QUERY, SQLiteHandler
 
 LOCAL = {
     "radio_id": "local",
@@ -258,8 +258,8 @@ def test_buckets_are_keyed_by_the_same_boundaries_for_every_radio(handler):
     assert set(link_edges) <= {b["timestamp"] for b in result["buckets"]}
 
 
-def test_realistic_day_of_traffic_uses_the_timestamp_index(handler):
-    """A 24 h window stays a bounded index range-scan, not a table scan."""
+def test_realistic_day_of_traffic_is_served_index_only(handler):
+    """A 24 h window is a range scan of the covering index, never the row heap."""
     day_start = BASE_TS - 86400
     for i in range(5000):
         _store(
@@ -273,13 +273,21 @@ def test_realistic_day_of_traffic_uses_the_timestamp_index(handler):
         _store(handler, timestamp=day_start - 10_000 - i, rx_radio_id="local")
 
     with handler._connect() as conn:
+        # The exact query get_airtime_buckets runs, so a new column cannot slip
+        # out of the index again without this failing.
         plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT timestamp, length, transmitted, rx_radio_id, "
-            "tx_radio_id, tx_radio_ids FROM packets "
-            "WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
-            (day_start, BASE_TS),
+            "EXPLAIN QUERY PLAN " + AIRTIME_BUCKETS_QUERY, (day_start, BASE_TS)
         ).fetchall()
-    assert any("idx_packets_timestamp" in str(tuple(row)) for row in plan), plan
+        legacy_plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT timestamp, length, payload_length, transmitted "
+            "FROM packets WHERE timestamp >= ? AND timestamp <= ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (day_start, BASE_TS, 50000),
+        ).fetchall()
+    assert any("COVERING INDEX idx_packets_airtime" in str(tuple(row)) for row in plan), plan
+    assert any("COVERING INDEX idx_packets_airtime" in str(tuple(row)) for row in legacy_plan), (
+        legacy_plan
+    )
 
     started = time.perf_counter()
     result = handler.get_airtime_buckets(

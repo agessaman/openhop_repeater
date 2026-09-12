@@ -28,7 +28,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler  # noqa: E402
+from repeater.data_acquisition.sqlite_handler import (  # noqa: E402
+    AIRTIME_INDEX_COLUMNS,
+    SQLiteHandler,
+)
 
 # The packets columns that predate migration 13. Enough of the real schema for
 # the handler to treat this as an existing database rather than a fresh one.
@@ -223,5 +226,50 @@ def test_fresh_database_also_gets_column_and_index():
         path = os.path.join(d, "repeater.db")
         assert {"upstream_hash", "upstream_hash_size"} <= _columns(path)
         assert "idx_packets_upstream_time" in _indexes(path)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _index_columns(path, name):
+    con = sqlite3.connect(path)
+    try:
+        return tuple(row[2] for row in con.execute("PRAGMA index_info(%s)" % name))
+    finally:
+        con.close()
+
+
+def test_upgrade_widens_the_existing_airtime_index_to_radio_ids(legacy_db):
+    """An install that already built the four-column index gets it rebuilt.
+
+    CREATE INDEX IF NOT EXISTS leaves an existing index as it is, so without the
+    migration an upgraded database would keep the narrow index and the airtime
+    chart would read the row heap for every packet in its window.
+    """
+    d, path = legacy_db
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE INDEX idx_packets_airtime ON packets(timestamp, length, payload_length, transmitted)"
+    )
+    con.commit()
+    con.close()
+
+    SQLiteHandler(Path(d))
+
+    assert _index_columns(path, "idx_packets_airtime") == AIRTIME_INDEX_COLUMNS
+    con = sqlite3.connect(path)
+    try:
+        assert con.execute("SELECT timestamp, type, length FROM packets").fetchall() == [
+            (1.0, 1, 10)
+        ]
+    finally:
+        con.close()
+
+
+def test_fresh_database_airtime_index_covers_radio_ids():
+    d = tempfile.mkdtemp()
+    try:
+        SQLiteHandler(Path(d))
+        path = os.path.join(d, "repeater.db")
+        assert _index_columns(path, "idx_packets_airtime") == AIRTIME_INDEX_COLUMNS
     finally:
         shutil.rmtree(d, ignore_errors=True)

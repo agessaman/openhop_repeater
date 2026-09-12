@@ -13,6 +13,24 @@ from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
 
 logger = logging.getLogger("SQLiteHandler")
 
+# Every column the airtime charts read. idx_packets_airtime must hold all of
+# them: on slow storage the difference between an index-only range scan and a
+# heap lookup per row is what keeps a 24 h window inside the client timeout.
+AIRTIME_INDEX_COLUMNS = (
+    "timestamp",
+    "length",
+    "payload_length",
+    "transmitted",
+    "rx_radio_id",
+    "tx_radio_id",
+    "tx_radio_ids",
+)
+
+AIRTIME_BUCKETS_QUERY = (
+    "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, tx_radio_ids "
+    "FROM packets WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC"
+)
+
 
 class SQLiteHandler:
     def __init__(self, storage_dir: Path):
@@ -230,8 +248,11 @@ class SQLiteHandler:
                 )
                 # Covering index for the airtime/utilization charts. get_airtime_data
                 # and get_airtime_buckets range-scan and order by timestamp, selecting
-                # only these columns; keeping them all in the index lets SQLite serve
-                # the query index-only, avoiding a full scan of the (large) row heap.
+                # only indexed columns, so SQLite serves them index-only instead of
+                # reading the (large) row heap. This creates the original four-column
+                # shape, which is safe before the radio id columns exist; the
+                # packets_airtime_index_radio_ids migration widens it to
+                # AIRTIME_INDEX_COLUMNS.
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_airtime "
                     "ON packets(timestamp, length, payload_length, transmitted)"
@@ -836,6 +857,34 @@ class SQLiteHandler:
                         conn.execute("ALTER TABLE packets ADD COLUMN tx_radio_ids TEXT")
                         logger.info("Added tx_radio_ids column to packets table")
 
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 18: widen idx_packets_airtime to the radio id columns.
+                # get_airtime_buckets reads them to charge airtime per radio, and
+                # without them in the index every row in the window costs a heap
+                # lookup. CREATE INDEX IF NOT EXISTS never reshapes an existing
+                # index, so drop and rebuild it. Runs after migrations 16 and 17,
+                # which add the columns it spans.
+                migration_name = "packets_airtime_index_radio_ids"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    logger.info(
+                        "Rebuilding idx_packets_airtime to cover radio ids; "
+                        "this reads the packets table once"
+                    )
+                    conn.execute("DROP INDEX IF EXISTS idx_packets_airtime")
+                    conn.execute(
+                        "CREATE INDEX idx_packets_airtime ON packets("
+                        + ", ".join(AIRTIME_INDEX_COLUMNS)
+                        + ")"
+                    )
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
@@ -2332,10 +2381,7 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, "
-                    "tx_radio_ids FROM packets "
-                    "WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
-                    (start_timestamp, end_timestamp),
+                    AIRTIME_BUCKETS_QUERY, (start_timestamp, end_timestamp)
                 ).fetchall()
 
             totals: dict = {}
