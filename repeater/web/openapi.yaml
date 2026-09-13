@@ -5620,6 +5620,8 @@ components:
           items:
             $ref: '#/components/schemas/NeighborLinkSnapshot'
         active_within_seconds:
+          type: number
+        limit:
           type: integer
         count:
           type: integer
