@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-B3Kkg7Bj.js";export{e as useDataService};
