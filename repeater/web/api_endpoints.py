@@ -4452,6 +4452,7 @@ class APIEndpoints:
                 end_timestamp=end_ts,
                 bucket_seconds=bucket_s,
                 severe_attempt_threshold=severe_threshold,
+                radio_profiles=self._active_radio_profiles(),
             )
 
             rrd_data = storage.get_rrd_data(
@@ -4538,6 +4539,12 @@ class APIEndpoints:
                 ),
             }
 
+            limitations = [
+                "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
+                "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
+                "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
+            ]
+
             diagnostics = {
                 "start_time": int(start_ts),
                 "end_time": int(end_ts),
@@ -4548,12 +4555,19 @@ class APIEndpoints:
                 "packet_types": lbt.get("packet_types", []),
                 "packet_type_buckets": merged_packet_type_buckets,
                 "correlations": correlations,
-                "limitations": [
-                    "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
-                    "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
-                    "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
-                ],
+                "limitations": limitations,
             }
+
+            if "radios" in lbt:
+                # Per-radio buckets carry no rf block: the RRD series behind it is
+                # node-wide, so attaching it to one radio would read as that
+                # radio's own RSSI, SNR and loss.
+                diagnostics["radios"] = lbt["radios"]
+                diagnostics["unattributed_transmissions"] = lbt.get("unattributed_transmissions", 0)
+                limitations.append(
+                    "Per-radio figures count physical transmissions and carry no RF or "
+                    "packet-type breakdown; the combined figures count each packet once."
+                )
 
             return self._success(diagnostics)
 

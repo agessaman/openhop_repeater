@@ -1372,6 +1372,8 @@ paths:
         Notes:
         - LBT total attempts are derived as `lbt_attempts + 1` from stored packet metadata.
         - Buckets are bounded and aggregated server-side for efficient dashboard refresh.
+        - On a node with two or more radios the response also carries `radios`, the same
+          summary and bucket shape per radio, counting physical transmissions.
       parameters:
         - name: hours
           in: query
@@ -5884,6 +5886,36 @@ components:
           type: array
           items:
             type: string
+        radios:
+          type: array
+          description: >-
+            Present only on a node with two or more radios. One entry per configured
+            radio, counting physical transmissions from the packet_egress table, so a
+            packet fanned out across a bridge is counted on each radio it left by and a
+            send that failed on one radio is counted there. The combined summary and
+            buckets above are unchanged and still count each packet once. Per-radio
+            entries carry no rf block (the RRD series behind it is node-wide) and no
+            packet-type breakdown.
+          items:
+            $ref: '#/components/schemas/LbtRadioSeries'
+        unattributed_transmissions:
+          type: integer
+          description: >-
+            Physical sends whose radio is no longer configured. Present alongside
+            radios; counted here rather than blamed on another radio's contention.
+
+    LbtRadioSeries:
+      type: object
+      required: [radio_id, summary, buckets]
+      properties:
+        radio_id:
+          type: string
+        summary:
+          $ref: '#/components/schemas/LbtSummary'
+        buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/LbtBucket'
 
     LbtPacketTypeSummary:
       type: object

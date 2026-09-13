@@ -964,3 +964,26 @@ def test_fanout_result_primary_is_first_successful_egress():
     assert failed.any_success is False
     assert failed.primary.radio_id == "link"
     assert FanoutTxResult().all_success is False
+
+
+@pytest.mark.asyncio
+async def test_multi_ack_redundancy_copies_are_recorded_per_radio():
+    """A redundancy burst is real airtime on both radios, so it belongs in the rows.
+
+    Only the primary result used to be recorded, which undercounted exactly the
+    traffic multi-ack adds to a channel that is already busy enough to need it.
+    """
+    rig = _Rig({"repeat_on_ingress": True}, multi_acks=1)
+    pkt = _direct(payload=b"\x4d\xab\xaf\x95", payload_type=PAYLOAD_TYPE_ACK, rx="local")
+
+    assert await rig.handler(pkt, _rx("local")) is True
+
+    calls = rig.handler.storage.record_packet.call_args_list
+    egress = calls[-1].kwargs.get("tx_egress")
+    # The plain ACK and its MULTIPART-wrapped copy, each on both radios.
+    assert len(rig.air.frames) == 4
+    assert len(egress) == 4
+    assert sorted(row["radio_id"] for row in egress) == sorted(
+        radio_id for radio_id, _ in rig.sent_packets
+    )
+    assert all(row["success"] for row in egress)

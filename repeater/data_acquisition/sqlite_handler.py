@@ -187,6 +187,68 @@ CRC_ERROR_COUNT_BY_RADIO_QUERY = (
     "WHERE radio_id = ? AND timestamp > ?"
 )
 
+# Per-radio LBT, read from packet_egress rather than packets: one row per
+# physical send, so a packet fanned out across a bridge is counted on each radio
+# it went out on, and a send that failed on one radio is counted there too.
+# Written out in full rather than sharing a CTE constant: bandit B608 flags any
+# query built by concatenation, even from literals.
+LBT_EGRESS_BUCKETS_QUERY = """
+    WITH egress AS (
+        SELECT
+            CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+            radio_id,
+            CASE
+                WHEN lbt_attempts IS NULL OR lbt_attempts < 0 THEN 1
+                ELSE lbt_attempts + 1
+            END AS attempts_total,
+            CASE WHEN success = 1 THEN 1 ELSE 0 END AS tx_success,
+            CASE WHEN COALESCE(lbt_channel_busy, 0) = 1 THEN 1 ELSE 0 END AS busy
+        FROM packet_egress INDEXED BY idx_packet_egress_time_radio
+        WHERE timestamp >= ?
+          AND timestamp <= ?
+    )
+    SELECT
+        bucket_ts,
+        radio_id,
+        COUNT(*) AS transmissions,
+        SUM(attempts_total) AS total_attempts,
+        SUM(CASE WHEN attempts_total = 1 THEN 1 ELSE 0 END) AS attempts_1,
+        SUM(CASE WHEN attempts_total = 2 THEN 1 ELSE 0 END) AS attempts_2,
+        SUM(CASE WHEN attempts_total = 3 THEN 1 ELSE 0 END) AS attempts_3,
+        SUM(CASE WHEN attempts_total >= 4 THEN 1 ELSE 0 END) AS attempts_4_plus,
+        SUM(CASE WHEN attempts_total > 1 THEN 1 ELSE 0 END) AS retry_packets,
+        SUM(CASE WHEN tx_success = 1 AND attempts_total = 1 THEN 1 ELSE 0 END)
+            AS first_attempt_success,
+        SUM(CASE WHEN tx_success = 0 THEN 1 ELSE 0 END) AS failed_transmissions,
+        SUM(busy) AS busy_channel_events,
+        SUM(CASE WHEN attempts_total >= ? THEN 1 ELSE 0 END) AS severe_contention_count,
+        MAX(attempts_total) AS max_attempts
+    FROM egress
+    GROUP BY bucket_ts, radio_id
+    ORDER BY bucket_ts ASC
+"""
+
+LBT_EGRESS_DISTRIBUTION_QUERY = """
+    WITH egress AS (
+        SELECT
+            CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+            radio_id,
+            CASE
+                WHEN lbt_attempts IS NULL OR lbt_attempts < 0 THEN 1
+                ELSE lbt_attempts + 1
+            END AS attempts_total,
+            CASE WHEN success = 1 THEN 1 ELSE 0 END AS tx_success,
+            CASE WHEN COALESCE(lbt_channel_busy, 0) = 1 THEN 1 ELSE 0 END AS busy
+        FROM packet_egress INDEXED BY idx_packet_egress_time_radio
+        WHERE timestamp >= ?
+          AND timestamp <= ?
+    )
+    SELECT bucket_ts, radio_id, attempts_total, COUNT(*) AS cnt
+    FROM egress
+    GROUP BY bucket_ts, radio_id, attempts_total
+    ORDER BY bucket_ts ASC, attempts_total ASC
+"""
+
 ROUTE_NAMES = {0: "Transport Flood", 1: "Flood", 2: "Direct", 3: "Transport Direct"}
 
 
@@ -216,6 +278,287 @@ def packet_carriers(transmitted, rx_radio_id, tx_radio_id, tx_radio_ids) -> Tupl
         return [rx_radio_id], []
     rx_ids = [rx_radio_id] if rx_radio_id is not None else []
     return rx_ids, decode_tx_radio_ids(tx_radio_ids) or [tx_radio_id]
+
+
+def _lbt_weighted_percentile(attempt_counts: dict, q: float) -> Optional[float]:
+    total = sum(int(v) for v in attempt_counts.values())
+    if total <= 0:
+        return None
+
+    q = max(0.0, min(1.0, float(q)))
+    # Use nearest-rank percentile so p95 on sparse samples doesn't
+    # systematically under-report tail attempts.
+    rank = max(1, int(math.ceil(total * q)))
+    running = 0
+    for attempt in sorted(int(k) for k in attempt_counts.keys()):
+        running += int(attempt_counts.get(attempt, 0))
+        if running >= rank:
+            return float(attempt)
+    return float(max(int(k) for k in attempt_counts.keys()))
+
+
+def _lbt_distributions(dist_rows) -> Tuple[dict, dict]:
+    """Fold attempt-count rows into per-bucket and overall distributions."""
+    dist_by_bucket: dict = {}
+    overall_dist: dict = {}
+    for row in dist_rows:
+        bucket_ts = int(row["bucket_ts"])
+        attempt = int(row["attempts_total"])
+        count = int(row["cnt"])
+        bucket_dist = dist_by_bucket.setdefault(bucket_ts, {})
+        bucket_dist[attempt] = bucket_dist.get(attempt, 0) + count
+        overall_dist[attempt] = overall_dist.get(attempt, 0) + count
+    return dist_by_bucket, overall_dist
+
+
+def _lbt_bucket_series(
+    aggregate_rows,
+    dist_by_bucket: dict,
+    start_timestamp: float,
+    end_timestamp: float,
+    bucket_seconds: int,
+) -> list:
+    """Expand grouped LBT counters onto every bucket in the window.
+
+    Empty buckets are kept so a chart draws a gap rather than joining across
+    hours of silence.
+    """
+    bucket_map: dict = {}
+    start_bucket = int(float(start_timestamp) // bucket_seconds) * bucket_seconds
+    end_bucket = int(float(end_timestamp) // bucket_seconds) * bucket_seconds
+    for bucket_ts in range(start_bucket, end_bucket + 1, bucket_seconds):
+        bucket_map[bucket_ts] = {
+            "timestamp": bucket_ts,
+            "transmissions": 0,
+            "total_attempts": 0,
+            "attempts_1": 0,
+            "attempts_2": 0,
+            "attempts_3": 0,
+            "attempts_4_plus": 0,
+            "retry_packets": 0,
+            "first_attempt_success": 0,
+            "failed_transmissions": 0,
+            "busy_channel_events": 0,
+            "severe_contention_count": 0,
+            "max_attempts": 0,
+        }
+
+    for row in aggregate_rows:
+        bucket_ts = int(row["bucket_ts"])
+        if bucket_ts not in bucket_map:
+            bucket_map[bucket_ts] = {
+                "timestamp": bucket_ts,
+                "transmissions": 0,
+                "total_attempts": 0,
+                "attempts_1": 0,
+                "attempts_2": 0,
+                "attempts_3": 0,
+                "attempts_4_plus": 0,
+                "retry_packets": 0,
+                "first_attempt_success": 0,
+                "failed_transmissions": 0,
+                "busy_channel_events": 0,
+                "severe_contention_count": 0,
+                "max_attempts": 0,
+            }
+        bucket_map[bucket_ts].update(
+            {
+                "transmissions": int(row["transmissions"] or 0),
+                "total_attempts": int(row["total_attempts"] or 0),
+                "attempts_1": int(row["attempts_1"] or 0),
+                "attempts_2": int(row["attempts_2"] or 0),
+                "attempts_3": int(row["attempts_3"] or 0),
+                "attempts_4_plus": int(row["attempts_4_plus"] or 0),
+                "retry_packets": int(row["retry_packets"] or 0),
+                "first_attempt_success": int(row["first_attempt_success"] or 0),
+                "failed_transmissions": int(row["failed_transmissions"] or 0),
+                "busy_channel_events": int(row["busy_channel_events"] or 0),
+                "severe_contention_count": int(row["severe_contention_count"] or 0),
+                "max_attempts": int(row["max_attempts"] or 0),
+            }
+        )
+
+    buckets = []
+    for bucket_ts in sorted(bucket_map.keys()):
+        bucket = bucket_map[bucket_ts]
+        transmissions = int(bucket["transmissions"])
+        total_attempts = int(bucket["total_attempts"])
+        attempts_3_plus = int(bucket["attempts_3"] + bucket["attempts_4_plus"])
+
+        median_attempts = _lbt_weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.5)
+        p95_attempts = _lbt_weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.95)
+
+        retry_rate_pct = None
+        first_attempt_success_rate_pct = None
+        avg_attempts = None
+        attempts_3_plus_pct = None
+        attempts_4_plus_pct = None
+        severe_contention_pct = None
+
+        if transmissions > 0:
+            retry_rate_pct = (bucket["retry_packets"] * 100.0) / transmissions
+            first_attempt_success_rate_pct = (
+                bucket["first_attempt_success"] * 100.0
+            ) / transmissions
+            avg_attempts = total_attempts / transmissions
+            attempts_3_plus_pct = (attempts_3_plus * 100.0) / transmissions
+            attempts_4_plus_pct = (bucket["attempts_4_plus"] * 100.0) / transmissions
+            severe_contention_pct = (bucket["severe_contention_count"] * 100.0) / transmissions
+
+        buckets.append(
+            {
+                "timestamp": bucket_ts,
+                "transmissions": transmissions,
+                "total_attempts": total_attempts,
+                "first_attempt_success": int(bucket["first_attempt_success"]),
+                "retry_packets": int(bucket["retry_packets"]),
+                "retry_rate_pct": retry_rate_pct,
+                "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
+                "avg_attempts": avg_attempts,
+                "median_attempts": median_attempts,
+                "p95_attempts": p95_attempts,
+                "max_attempts": int(bucket["max_attempts"]),
+                "attempts_1": int(bucket["attempts_1"]),
+                "attempts_2": int(bucket["attempts_2"]),
+                "attempts_3": int(bucket["attempts_3"]),
+                "attempts_4_plus": int(bucket["attempts_4_plus"]),
+                "attempts_3_plus": int(attempts_3_plus),
+                "attempts_3_plus_pct": attempts_3_plus_pct,
+                "attempts_4_plus_pct": attempts_4_plus_pct,
+                "failed_transmissions": int(bucket["failed_transmissions"]),
+                "busy_channel_events": int(bucket["busy_channel_events"]),
+                "severe_contention_count": int(bucket["severe_contention_count"]),
+                "severe_contention_pct": severe_contention_pct,
+            }
+        )
+    return buckets
+
+
+def _lbt_radio_series(
+    bucket_rows,
+    dist_rows,
+    resolver: "RadioResolver",
+    start_timestamp: float,
+    end_timestamp: float,
+    bucket_seconds: int,
+    severe_attempt_threshold: int,
+) -> Tuple[list, int]:
+    """Split per-egress LBT rows into one bucket series and summary per radio.
+
+    Returns ``(radios, unattributed)``. A row whose radio is no longer
+    configured is counted as unattributed rather than folded into another
+    radio's contention figures, which would blame the wrong band.
+    """
+    buckets_by_radio: dict = {radio_id: [] for radio_id in resolver.order}
+    dists_by_radio: dict = {radio_id: [] for radio_id in resolver.order}
+    unattributed = 0
+
+    for row in bucket_rows:
+        radio_id = resolver.resolve(row["radio_id"])
+        if radio_id is None:
+            unattributed += int(row["transmissions"] or 0)
+            continue
+        buckets_by_radio[radio_id].append(row)
+
+    for row in dist_rows:
+        radio_id = resolver.resolve(row["radio_id"])
+        if radio_id is not None:
+            dists_by_radio[radio_id].append(row)
+
+    radios = []
+    for radio_id in resolver.order:
+        dist_by_bucket, overall_dist = _lbt_distributions(dists_by_radio[radio_id])
+        buckets = _lbt_bucket_series(
+            buckets_by_radio[radio_id],
+            dist_by_bucket,
+            start_timestamp,
+            end_timestamp,
+            bucket_seconds,
+        )
+        radios.append(
+            {
+                "radio_id": radio_id,
+                "summary": _lbt_summary(buckets, overall_dist, severe_attempt_threshold),
+                "buckets": buckets,
+            }
+        )
+    return radios, unattributed
+
+
+def _lbt_summary(buckets: list, overall_dist: dict, severe_attempt_threshold: int) -> dict:
+    """Roll a bucket series up into the window summary."""
+    total_transmissions = int(sum(b["transmissions"] for b in buckets))
+    total_attempts = int(sum(b["total_attempts"] for b in buckets))
+    first_attempt_success = int(sum(b["first_attempt_success"] for b in buckets))
+    retry_packets = int(sum(b["retry_packets"] for b in buckets))
+    attempts_1 = int(sum(b["attempts_1"] for b in buckets))
+    attempts_2 = int(sum(b["attempts_2"] for b in buckets))
+    attempts_3 = int(sum(b["attempts_3"] for b in buckets))
+    attempts_4_plus = int(sum(b["attempts_4_plus"] for b in buckets))
+    attempts_3_plus = int(attempts_3 + attempts_4_plus)
+    failed_transmissions = int(sum(b["failed_transmissions"] for b in buckets))
+    busy_channel_events = int(sum(b["busy_channel_events"] for b in buckets))
+    severe_contention_count = int(sum(b["severe_contention_count"] for b in buckets))
+    max_attempts = int(max([b["max_attempts"] for b in buckets], default=0))
+
+    retry_rate_pct = None
+    first_attempt_success_rate_pct = None
+    avg_attempts = None
+    attempts_3_plus_pct = None
+    attempts_4_plus_pct = None
+    severe_contention_pct = None
+
+    if total_transmissions > 0:
+        retry_rate_pct = (retry_packets * 100.0) / total_transmissions
+        first_attempt_success_rate_pct = (first_attempt_success * 100.0) / total_transmissions
+        avg_attempts = total_attempts / total_transmissions
+        attempts_3_plus_pct = (attempts_3_plus * 100.0) / total_transmissions
+        attempts_4_plus_pct = (attempts_4_plus * 100.0) / total_transmissions
+        severe_contention_pct = (severe_contention_count * 100.0) / total_transmissions
+
+    worst_bucket = None
+    scored_buckets = [
+        b
+        for b in buckets
+        if int(b.get("transmissions", 0)) > 0 and b.get("retry_rate_pct") is not None
+    ]
+    if scored_buckets:
+        worst = max(scored_buckets, key=lambda item: float(item.get("retry_rate_pct") or 0.0))
+        worst_bucket = {
+            "timestamp": int(worst["timestamp"]),
+            "retry_rate_pct": float(worst.get("retry_rate_pct") or 0.0),
+            "attempts_3_plus_pct": float(worst.get("attempts_3_plus_pct") or 0.0),
+            "max_attempts": int(worst.get("max_attempts") or 0),
+            "transmissions": int(worst.get("transmissions") or 0),
+        }
+
+    summary = {
+        "total_transmissions": total_transmissions,
+        "total_attempts": total_attempts,
+        "first_attempt_success": first_attempt_success,
+        "retry_packets": retry_packets,
+        "retry_rate_pct": retry_rate_pct,
+        "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
+        "avg_attempts": avg_attempts,
+        "median_attempts": _lbt_weighted_percentile(overall_dist, 0.5),
+        "p95_attempts": _lbt_weighted_percentile(overall_dist, 0.95),
+        "max_attempts": max_attempts,
+        "attempts_1": attempts_1,
+        "attempts_2": attempts_2,
+        "attempts_3": attempts_3,
+        "attempts_4_plus": attempts_4_plus,
+        "attempts_3_plus": attempts_3_plus,
+        "attempts_3_plus_pct": attempts_3_plus_pct,
+        "attempts_4_plus_pct": attempts_4_plus_pct,
+        "failed_transmissions": failed_transmissions,
+        "busy_channel_events": busy_channel_events,
+        "severe_contention_count": severe_contention_count,
+        "severe_contention_pct": severe_contention_pct,
+        "severe_attempt_threshold": severe_attempt_threshold,
+        "has_lbt_data": total_transmissions > 0,
+        "worst_bucket": worst_bucket,
+    }
+    return summary
 
 
 class RadioResolver:
@@ -524,6 +867,26 @@ class SQLiteHandler:
                 """
                 )
 
+                # One row per physical transmission of a packet, written only on a
+                # node with two or more radios. The packets table carries the
+                # primary egress; a bridge fans one packet out across radios whose
+                # LBT outcomes differ, and a send that failed on one radio leaves
+                # no trace there at all.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS packet_egress (
+                        id INTEGER PRIMARY KEY,
+                        packet_id INTEGER NOT NULL,
+                        timestamp REAL NOT NULL,
+                        radio_id TEXT,
+                        success INTEGER NOT NULL DEFAULT 0,
+                        lbt_attempts INTEGER NOT NULL DEFAULT 0,
+                        lbt_backoff_ms_total REAL NOT NULL DEFAULT 0,
+                        lbt_channel_busy INTEGER NOT NULL DEFAULT 0
+                    )
+                """
+                )
+
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS transport_keys (
@@ -585,6 +948,12 @@ class SQLiteHandler:
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_crc_errors_timestamp ON crc_errors(timestamp)"
+                )
+                # Covering: the LBT aggregate reads only these columns, so a
+                # window of egresses never touches the row heap.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_packet_egress_time_radio ON packet_egress("
+                    "timestamp, radio_id, success, lbt_attempts, lbt_channel_busy)"
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_transport_keys_name ON transport_keys(name)"
@@ -1250,6 +1619,39 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 20: per-egress TX metadata. CREATE TABLE IF NOT EXISTS
+                # above already covers a fresh database; this creates the table and
+                # its index on one that predates them.
+                migration_name = "add_packet_egress"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS packet_egress (
+                            id INTEGER PRIMARY KEY,
+                            packet_id INTEGER NOT NULL,
+                            timestamp REAL NOT NULL,
+                            radio_id TEXT,
+                            success INTEGER NOT NULL DEFAULT 0,
+                            lbt_attempts INTEGER NOT NULL DEFAULT 0,
+                            lbt_backoff_ms_total REAL NOT NULL DEFAULT 0,
+                            lbt_channel_busy INTEGER NOT NULL DEFAULT 0
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_packet_egress_time_radio ON packet_egress("
+                        "timestamp, radio_id, success, lbt_attempts, lbt_channel_busy)"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -1535,6 +1937,45 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to store packet in SQLite: {e}")
 
+    def store_packet_egress(self, packet_id: int, timestamp: float, egresses) -> None:
+        """Persist one row per physical send of a stored packet.
+
+        Written only on a node with two or more radios: with one radio the
+        packet row already says everything this table would. Failed egresses are
+        stored too -- a forward can go out on one band and be held off on the
+        other, and until now that half of the story survived only in the log.
+        """
+        if not packet_id or not egresses:
+            return
+        try:
+            rows = [
+                (
+                    int(packet_id),
+                    float(timestamp),
+                    egress.get("radio_id"),
+                    int(bool(egress.get("success"))),
+                    int(egress.get("lbt_attempts") or 0),
+                    float(egress.get("lbt_backoff_ms_total") or 0.0),
+                    int(bool(egress.get("lbt_channel_busy"))),
+                )
+                for egress in egresses
+                if isinstance(egress, dict)
+            ]
+            if not rows:
+                return
+            with self._connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO packet_egress (
+                        packet_id, timestamp, radio_id, success,
+                        lbt_attempts, lbt_backoff_ms_total, lbt_channel_busy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                    rows,
+                )
+        except Exception as e:
+            logger.error(f"Failed to store packet egress in SQLite: {e}")
+
     def store_advert(self, record: dict):
         try:
             with self._connect() as conn:
@@ -1766,6 +2207,7 @@ class SQLiteHandler:
         end_timestamp: float,
         bucket_seconds: int = 300,
         severe_attempt_threshold: int = 4,
+        radio_profiles: Optional[list] = None,
     ) -> dict:
         """Return aggregated LBT diagnostics for TX-path packets.
 
@@ -1775,23 +2217,14 @@ class SQLiteHandler:
 
         This method avoids returning raw packet rows and instead returns
         bucketed aggregates + summary metrics for efficient dashboard refreshes.
+
+        On a node with two or more radios the answer also carries ``radios``: the
+        same bucket and summary shape per radio, read from ``packet_egress`` so a
+        packet fanned out across a bridge is counted on each radio it left by.
+        The combined figures above it are unchanged and still count one packet
+        once. There is no per-radio packet-type breakdown: packet type lives on
+        the packet row, and joining to it would cost a heap lookup per egress.
         """
-
-        def _weighted_percentile(attempt_counts: dict, q: float) -> Optional[float]:
-            total = sum(int(v) for v in attempt_counts.values())
-            if total <= 0:
-                return None
-
-            q = max(0.0, min(1.0, float(q)))
-            # Use nearest-rank percentile so p95 on sparse samples doesn't
-            # systematically under-report tail attempts.
-            rank = max(1, int(math.ceil(total * q)))
-            running = 0
-            for attempt in sorted(int(k) for k in attempt_counts.keys()):
-                running += int(attempt_counts.get(attempt, 0))
-                if running >= rank:
-                    return float(attempt)
-            return float(max(int(k) for k in attempt_counts.keys()))
 
         def _packet_type_name(pkt_type: int) -> str:
             try:
@@ -1827,6 +2260,8 @@ class SQLiteHandler:
 
             if end_timestamp < start_timestamp:
                 start_timestamp, end_timestamp = end_timestamp, start_timestamp
+
+            resolver = RadioResolver(radio_profiles)
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -1952,202 +2387,27 @@ class SQLiteHandler:
                     ),
                 ).fetchall()
 
-            dist_by_bucket: dict = {}
-            overall_dist: dict = {}
-            for row in dist_rows:
-                bucket_ts = int(row["bucket_ts"])
-                attempt = int(row["attempts_total"])
-                count = int(row["cnt"])
-                bucket_dist = dist_by_bucket.setdefault(bucket_ts, {})
-                bucket_dist[attempt] = bucket_dist.get(attempt, 0) + count
-                overall_dist[attempt] = overall_dist.get(attempt, 0) + count
+                radio_bucket_rows = []
+                radio_dist_rows = []
+                if resolver.multi:
+                    egress_params = (
+                        bucket_seconds,
+                        bucket_seconds,
+                        float(start_timestamp),
+                        float(end_timestamp),
+                    )
+                    radio_bucket_rows = conn.execute(
+                        LBT_EGRESS_BUCKETS_QUERY, egress_params + (severe_attempt_threshold,)
+                    ).fetchall()
+                    radio_dist_rows = conn.execute(
+                        LBT_EGRESS_DISTRIBUTION_QUERY, egress_params
+                    ).fetchall()
 
-            bucket_map: dict = {}
-            start_bucket = int(float(start_timestamp) // bucket_seconds) * bucket_seconds
-            end_bucket = int(float(end_timestamp) // bucket_seconds) * bucket_seconds
-            for bucket_ts in range(start_bucket, end_bucket + 1, bucket_seconds):
-                bucket_map[bucket_ts] = {
-                    "timestamp": bucket_ts,
-                    "transmissions": 0,
-                    "total_attempts": 0,
-                    "attempts_1": 0,
-                    "attempts_2": 0,
-                    "attempts_3": 0,
-                    "attempts_4_plus": 0,
-                    "retry_packets": 0,
-                    "first_attempt_success": 0,
-                    "failed_transmissions": 0,
-                    "busy_channel_events": 0,
-                    "severe_contention_count": 0,
-                    "max_attempts": 0,
-                }
-
-            for row in aggregate_rows:
-                bucket_ts = int(row["bucket_ts"])
-                if bucket_ts not in bucket_map:
-                    bucket_map[bucket_ts] = {
-                        "timestamp": bucket_ts,
-                        "transmissions": 0,
-                        "total_attempts": 0,
-                        "attempts_1": 0,
-                        "attempts_2": 0,
-                        "attempts_3": 0,
-                        "attempts_4_plus": 0,
-                        "retry_packets": 0,
-                        "first_attempt_success": 0,
-                        "failed_transmissions": 0,
-                        "busy_channel_events": 0,
-                        "severe_contention_count": 0,
-                        "max_attempts": 0,
-                    }
-                bucket_map[bucket_ts].update(
-                    {
-                        "transmissions": int(row["transmissions"] or 0),
-                        "total_attempts": int(row["total_attempts"] or 0),
-                        "attempts_1": int(row["attempts_1"] or 0),
-                        "attempts_2": int(row["attempts_2"] or 0),
-                        "attempts_3": int(row["attempts_3"] or 0),
-                        "attempts_4_plus": int(row["attempts_4_plus"] or 0),
-                        "retry_packets": int(row["retry_packets"] or 0),
-                        "first_attempt_success": int(row["first_attempt_success"] or 0),
-                        "failed_transmissions": int(row["failed_transmissions"] or 0),
-                        "busy_channel_events": int(row["busy_channel_events"] or 0),
-                        "severe_contention_count": int(row["severe_contention_count"] or 0),
-                        "max_attempts": int(row["max_attempts"] or 0),
-                    }
-                )
-
-            buckets = []
-            for bucket_ts in sorted(bucket_map.keys()):
-                bucket = bucket_map[bucket_ts]
-                transmissions = int(bucket["transmissions"])
-                total_attempts = int(bucket["total_attempts"])
-                attempts_3_plus = int(bucket["attempts_3"] + bucket["attempts_4_plus"])
-
-                median_attempts = _weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.5)
-                p95_attempts = _weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.95)
-
-                retry_rate_pct = None
-                first_attempt_success_rate_pct = None
-                avg_attempts = None
-                attempts_3_plus_pct = None
-                attempts_4_plus_pct = None
-                severe_contention_pct = None
-
-                if transmissions > 0:
-                    retry_rate_pct = (bucket["retry_packets"] * 100.0) / transmissions
-                    first_attempt_success_rate_pct = (
-                        bucket["first_attempt_success"] * 100.0
-                    ) / transmissions
-                    avg_attempts = total_attempts / transmissions
-                    attempts_3_plus_pct = (attempts_3_plus * 100.0) / transmissions
-                    attempts_4_plus_pct = (bucket["attempts_4_plus"] * 100.0) / transmissions
-                    severe_contention_pct = (
-                        bucket["severe_contention_count"] * 100.0
-                    ) / transmissions
-
-                buckets.append(
-                    {
-                        "timestamp": bucket_ts,
-                        "transmissions": transmissions,
-                        "total_attempts": total_attempts,
-                        "first_attempt_success": int(bucket["first_attempt_success"]),
-                        "retry_packets": int(bucket["retry_packets"]),
-                        "retry_rate_pct": retry_rate_pct,
-                        "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
-                        "avg_attempts": avg_attempts,
-                        "median_attempts": median_attempts,
-                        "p95_attempts": p95_attempts,
-                        "max_attempts": int(bucket["max_attempts"]),
-                        "attempts_1": int(bucket["attempts_1"]),
-                        "attempts_2": int(bucket["attempts_2"]),
-                        "attempts_3": int(bucket["attempts_3"]),
-                        "attempts_4_plus": int(bucket["attempts_4_plus"]),
-                        "attempts_3_plus": int(attempts_3_plus),
-                        "attempts_3_plus_pct": attempts_3_plus_pct,
-                        "attempts_4_plus_pct": attempts_4_plus_pct,
-                        "failed_transmissions": int(bucket["failed_transmissions"]),
-                        "busy_channel_events": int(bucket["busy_channel_events"]),
-                        "severe_contention_count": int(bucket["severe_contention_count"]),
-                        "severe_contention_pct": severe_contention_pct,
-                    }
-                )
-
-            total_transmissions = int(sum(b["transmissions"] for b in buckets))
-            total_attempts = int(sum(b["total_attempts"] for b in buckets))
-            first_attempt_success = int(sum(b["first_attempt_success"] for b in buckets))
-            retry_packets = int(sum(b["retry_packets"] for b in buckets))
-            attempts_1 = int(sum(b["attempts_1"] for b in buckets))
-            attempts_2 = int(sum(b["attempts_2"] for b in buckets))
-            attempts_3 = int(sum(b["attempts_3"] for b in buckets))
-            attempts_4_plus = int(sum(b["attempts_4_plus"] for b in buckets))
-            attempts_3_plus = int(attempts_3 + attempts_4_plus)
-            failed_transmissions = int(sum(b["failed_transmissions"] for b in buckets))
-            busy_channel_events = int(sum(b["busy_channel_events"] for b in buckets))
-            severe_contention_count = int(sum(b["severe_contention_count"] for b in buckets))
-            max_attempts = int(max([b["max_attempts"] for b in buckets], default=0))
-
-            retry_rate_pct = None
-            first_attempt_success_rate_pct = None
-            avg_attempts = None
-            attempts_3_plus_pct = None
-            attempts_4_plus_pct = None
-            severe_contention_pct = None
-
-            if total_transmissions > 0:
-                retry_rate_pct = (retry_packets * 100.0) / total_transmissions
-                first_attempt_success_rate_pct = (
-                    first_attempt_success * 100.0
-                ) / total_transmissions
-                avg_attempts = total_attempts / total_transmissions
-                attempts_3_plus_pct = (attempts_3_plus * 100.0) / total_transmissions
-                attempts_4_plus_pct = (attempts_4_plus * 100.0) / total_transmissions
-                severe_contention_pct = (severe_contention_count * 100.0) / total_transmissions
-
-            worst_bucket = None
-            scored_buckets = [
-                b
-                for b in buckets
-                if int(b.get("transmissions", 0)) > 0 and b.get("retry_rate_pct") is not None
-            ]
-            if scored_buckets:
-                worst = max(
-                    scored_buckets, key=lambda item: float(item.get("retry_rate_pct") or 0.0)
-                )
-                worst_bucket = {
-                    "timestamp": int(worst["timestamp"]),
-                    "retry_rate_pct": float(worst.get("retry_rate_pct") or 0.0),
-                    "attempts_3_plus_pct": float(worst.get("attempts_3_plus_pct") or 0.0),
-                    "max_attempts": int(worst.get("max_attempts") or 0),
-                    "transmissions": int(worst.get("transmissions") or 0),
-                }
-
-            summary = {
-                "total_transmissions": total_transmissions,
-                "total_attempts": total_attempts,
-                "first_attempt_success": first_attempt_success,
-                "retry_packets": retry_packets,
-                "retry_rate_pct": retry_rate_pct,
-                "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
-                "avg_attempts": avg_attempts,
-                "median_attempts": _weighted_percentile(overall_dist, 0.5),
-                "p95_attempts": _weighted_percentile(overall_dist, 0.95),
-                "max_attempts": max_attempts,
-                "attempts_1": attempts_1,
-                "attempts_2": attempts_2,
-                "attempts_3": attempts_3,
-                "attempts_4_plus": attempts_4_plus,
-                "attempts_3_plus": attempts_3_plus,
-                "attempts_3_plus_pct": attempts_3_plus_pct,
-                "attempts_4_plus_pct": attempts_4_plus_pct,
-                "failed_transmissions": failed_transmissions,
-                "busy_channel_events": busy_channel_events,
-                "severe_contention_count": severe_contention_count,
-                "severe_contention_pct": severe_contention_pct,
-                "severe_attempt_threshold": severe_attempt_threshold,
-                "has_lbt_data": total_transmissions > 0,
-                "worst_bucket": worst_bucket,
-            }
+            dist_by_bucket, overall_dist = _lbt_distributions(dist_rows)
+            buckets = _lbt_bucket_series(
+                aggregate_rows, dist_by_bucket, start_timestamp, end_timestamp, bucket_seconds
+            )
+            summary = _lbt_summary(buckets, overall_dist, severe_attempt_threshold)
 
             packet_type_totals: dict = {}
             packet_type_buckets = []
@@ -2229,7 +2489,7 @@ class SQLiteHandler:
                     }
                 )
 
-            return {
+            diagnostics = {
                 "start_time": int(start_timestamp),
                 "end_time": int(end_timestamp),
                 "bucket_seconds": bucket_seconds,
@@ -2238,6 +2498,19 @@ class SQLiteHandler:
                 "packet_types": packet_types,
                 "packet_type_buckets": packet_type_buckets,
             }
+            if resolver.multi:
+                radios, unattributed = _lbt_radio_series(
+                    radio_bucket_rows,
+                    radio_dist_rows,
+                    resolver,
+                    start_timestamp,
+                    end_timestamp,
+                    bucket_seconds,
+                    severe_attempt_threshold,
+                )
+                diagnostics["radios"] = radios
+                diagnostics["unattributed_transmissions"] = unattributed
+            return diagnostics
 
         except Exception as e:
             logger.error(f"Failed to get LBT diagnostics: {e}")
@@ -3474,6 +3747,7 @@ class SQLiteHandler:
 
             tables_with_timestamp = [
                 "packets",
+                "packet_egress",
                 "adverts",
                 "noise_floor",
                 "crc_errors",
@@ -3482,6 +3756,9 @@ class SQLiteHandler:
             ]
             stats_queries = {
                 "packets": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM packets",
+                "packet_egress": (
+                    "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM packet_egress"
+                ),
                 "adverts": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM adverts",
                 "noise_floor": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM noise_floor",
                 "crc_errors": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM crc_errors",
@@ -3520,6 +3797,16 @@ class SQLiteHandler:
                 for table in tables_with_timestamp:
                     if table not in existing:
                         continue
+                    # packet_egress exists on every node but is written only on one
+                    # with two or more radios. Probing first keeps a single-radio
+                    # answer exactly what it was, and keeps the counting scan --
+                    # this table grows faster than packets on a bridge -- off a
+                    # node that has nothing in it.
+                    if (
+                        table == "packet_egress"
+                        and not conn.execute("SELECT 1 FROM packet_egress LIMIT 1").fetchone()
+                    ):
+                        continue
                     row = conn.execute(stats_queries[table]).fetchone()
                     count, oldest, newest = row[0], row[1], row[2]
                     table_info.append(
@@ -3555,6 +3842,7 @@ class SQLiteHandler:
         # Hardcoded allowlist — never allow arbitrary table names
         PURGEABLE = {
             "packets",
+            "packet_egress",
             "adverts",
             "noise_floor",
             "crc_errors",
@@ -3570,6 +3858,7 @@ class SQLiteHandler:
 
         purge_queries = {
             "packets": "DELETE FROM packets",
+            "packet_egress": "DELETE FROM packet_egress",
             "adverts": "DELETE FROM adverts",
             "noise_floor": "DELETE FROM noise_floor",
             "crc_errors": "DELETE FROM crc_errors",
@@ -3584,6 +3873,9 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 result = conn.execute(purge_queries[table_name])
+                if table_name == "packets":
+                    # An egress row is meaningless without the packet it sent.
+                    conn.execute("DELETE FROM packet_egress")
                 if table_name == "adverts":
                     # Purging the neighbour table has to take the scopes with it,
                     # or the UI shows scope counts for repeaters it no longer lists
@@ -3638,6 +3930,10 @@ class SQLiteHandler:
 
                 result = conn.execute("DELETE FROM crc_errors WHERE timestamp < ?", (cutoff,))
                 crc_deleted = result.rowcount
+
+                # Egress rows describe packets, so they age out on the same cutoff.
+                # Without this they would outlive every packet they refer to.
+                conn.execute("DELETE FROM packet_egress WHERE timestamp < ?", (cutoff,))
 
                 conn.commit()
 

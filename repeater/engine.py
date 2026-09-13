@@ -382,6 +382,7 @@ class RepeaterHandler(BaseHandler):
             or getattr(packet, "rx_radio_id", None)
         )
         tx_radio_ids_sent = None
+        tx_egress = None
         if local_transmission and not rx_radio_id:
             # Originated here: companion, repeater/room identity, protocol reply.
             tx_radio_ids = self._resolve_origin_tx_radio_ids()
@@ -534,6 +535,7 @@ class RepeaterHandler(BaseHandler):
                         tx_result.failed_radio_ids,
                     )
                 tx_radio_ids_sent = tx_result.successful_radio_ids or None
+                tx_egress = self._egress_records(tx_result)
 
                 # Scalar TX fields describe the primary egress.
                 primary = tx_result.primary
@@ -553,11 +555,18 @@ class RepeaterHandler(BaseHandler):
                         )
 
             # Redundancy copies ride alongside the primary result: collect them
-            # without letting a failed extra change the primary outcome.
+            # without letting a failed extra change the primary outcome. Their
+            # sends are physical transmissions like any other, so they belong in
+            # the egress rows -- leaving them out would undercount exactly the
+            # traffic a multi-ack burst adds to a busy channel.
             for extra_pkt, extra_task in extra_tx_tasks:
                 try:
-                    if (await self._await_egress_tx(extra_task, extra_pkt)).any_success:
+                    extra_result = await self._await_egress_tx(extra_task, extra_pkt)
+                    if extra_result.any_success:
                         self.forwarded_count += 1
+                    extra_egress = self._egress_records(extra_result)
+                    if extra_egress:
+                        tx_egress = (tx_egress or []) + extra_egress
                 except Exception as e:
                     logger.warning(f"Multi-ack redundancy TX failed: {e}")
         else:
@@ -652,7 +661,9 @@ class RepeaterHandler(BaseHandler):
                     DropReason.PATH_TOO_LONG,
                 )
                 skip_mqtt = drop_reason in invalid_reasons if drop_reason else False
-                self.storage.record_packet(packet_record, skip_mqtt_if_invalid=skip_mqtt)
+                self.storage.record_packet(
+                    packet_record, skip_mqtt_if_invalid=skip_mqtt, tx_egress=tx_egress
+                )
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
@@ -1923,7 +1934,10 @@ class RepeaterHandler(BaseHandler):
                     logger.warning("Fan-out TX via %s failed: %s", radio_id, outcome)
                     results.append(RadioTxResult(radio_id, False, error=outcome))
                     continue
-                metadata = getattr(pkt, "_tx_metadata", None) if outcome else None
+                # Read whether or not the send succeeded: a failed egress carries
+                # the LBT figures that explain why, and the single-egress path in
+                # _await_egress_tx has always read them unconditionally.
+                metadata = getattr(pkt, "_tx_metadata", None)
                 results.append(
                     RadioTxResult(
                         radio_id,
@@ -1982,6 +1996,38 @@ class RepeaterHandler(BaseHandler):
             local_transmission=local_transmission,
             preferred_tx_radio_id=tx_radio_ids[0] if tx_radio_ids else None,
         )
+
+    def _egress_records(self, tx_result: FanoutTxResult) -> Optional[list]:
+        """Per-radio egress rows for storage, or None on a node with one radio.
+
+        With one radio the packet row already says everything these would. A
+        bridge is different: one packet goes out on radios whose LBT outcomes
+        differ, only the primary egress reaches the packet row, and a send that
+        failed leaves no trace there at all.
+
+        A failed egress carries whatever LBT metadata the driver reported. Where
+        the radio raises instead of returning any (an SX1262 that gives up on a
+        busy channel), the row records the failure with no attempts rather than
+        inventing them: the driver has to report them before anything here can.
+        """
+        _, radio_ids = self._fabric_endpoints()
+        if not radio_ids or len(radio_ids) < 2:
+            return None
+
+        records = []
+        for result in tx_result.results:
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            backoffs = metadata.get("lbt_backoff_delays_ms") or []
+            records.append(
+                {
+                    "radio_id": result.radio_id,
+                    "success": bool(result.success),
+                    "lbt_attempts": int(metadata.get("lbt_attempts", 0) or 0),
+                    "lbt_backoff_ms_total": float(sum(backoffs)),
+                    "lbt_channel_busy": bool(metadata.get("lbt_channel_busy", False)),
+                }
+            )
+        return records or None
 
     @staticmethod
     async def _await_egress_tx(tx_task, fwd_pkt: Packet) -> FanoutTxResult:

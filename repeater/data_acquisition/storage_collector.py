@@ -196,7 +196,12 @@ class StorageCollector:
 
         return stats
 
-    def record_packet(self, packet_record: dict, skip_mqtt_if_invalid: bool = True):
+    def record_packet(
+        self,
+        packet_record: dict,
+        skip_mqtt_if_invalid: bool = True,
+        tx_egress: Optional[list] = None,
+    ):
         """Record a packet to storage and publish it.
 
         All blocking work — the SQLite write, the cumulative-counts aggregate, the
@@ -207,12 +212,17 @@ class StorageCollector:
         Args:
             packet_record: Dictionary containing packet information
             skip_mqtt_if_invalid: If True, don't publish packets with drop_reason to mqtt
+            tx_egress: One entry per physical send on a node with two or more
+                radios, stored beside the packet. Kept off packet_record so it
+                does not ride along on every websocket, Glass and MQTT publish.
         """
         logger.debug(
             f"Recording packet: type={packet_record.get('type')}, "
             f"transmitted={packet_record.get('transmitted')}"
         )
-        self._submit_db(self._record_packet_blocking, packet_record, skip_mqtt_if_invalid)
+        self._submit_db(
+            self._record_packet_blocking, packet_record, skip_mqtt_if_invalid, tx_egress
+        )
 
     def _submit_db(self, fn, *args):
         """Run a blocking storage operation on the dedicated writer thread.
@@ -232,11 +242,17 @@ class StorageCollector:
         except Exception as e:
             logger.error(f"Storage writer task failed: {e}", exc_info=True)
 
-    def _record_packet_blocking(self, packet_record: dict, skip_mqtt: bool):
+    def _record_packet_blocking(
+        self, packet_record: dict, skip_mqtt: bool, tx_egress: Optional[list] = None
+    ):
         """Store, aggregate, update metrics, and publish one packet (writer thread)."""
         packet_id = self.sqlite_handler.store_packet(packet_record)
         if packet_id is not None:
             packet_record["id"] = packet_id
+            if tx_egress:
+                self.sqlite_handler.store_packet_egress(
+                    packet_id, packet_record.get("timestamp", time.time()), tx_egress
+                )
 
         if self.rrd_handler is not None:
             cumulative_counts = self.sqlite_handler.get_cumulative_counts()
@@ -477,12 +493,14 @@ class StorageCollector:
         end_timestamp: float,
         bucket_seconds: int = 300,
         severe_attempt_threshold: int = 4,
+        radio_profiles: Optional[list] = None,
     ) -> dict:
         return self.sqlite_handler.get_lbt_diagnostics(
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
             bucket_seconds=bucket_seconds,
             severe_attempt_threshold=severe_attempt_threshold,
+            radio_profiles=radio_profiles,
         )
 
     def _radio_profiles(self) -> Optional[list]:
