@@ -5142,8 +5142,16 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0):
+    def noise_floor_history(
+        self, hours: int = 24, limit: int = None, offset: int = 0, radio_id: str = None
+    ):
+        """Noise floor samples, optionally for one radio.
 
+        On a node with two or more radios each row names the radio it was read
+        from, and ``radio_id`` pages that radio's samples on their own. Paging
+        the combined series by offset is stable only when nothing is filtered
+        out, which is why the RF Health page names a radio.
+        """
         try:
             storage = self._get_storage()
             hours = int(hours)
@@ -5159,31 +5167,37 @@ class APIEndpoints:
                 hours=hours,
                 limit=normalized_limit,
                 offset=offset,
+                radio_id=radio_id or None,
+                radio_profiles=self._active_radio_profiles(),
             )
 
-            return self._success(
-                {
-                    "history": history,
-                    "hours": hours,
-                    "count": len(history),
-                    "limit": normalized_limit,
-                    "offset": offset,
-                }
-            )
+            payload = {
+                "history": history,
+                "hours": hours,
+                "count": len(history),
+                "limit": normalized_limit,
+                "offset": offset,
+            }
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching noise floor history: {e}")
             return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_stats(self, hours: int = 24):
-
+    def noise_floor_stats(self, hours: int = 24, radio_id: str = None):
+        """Noise floor summary, for one radio when ``radio_id`` is given."""
         try:
             storage = self._get_storage()
             hours = int(hours)
-            stats = storage.get_noise_floor_stats(hours=hours)
+            stats = storage.get_noise_floor_stats(hours=hours, radio_id=radio_id or None)
 
-            return self._success({"stats": stats, "hours": hours})
+            payload = {"stats": stats, "hours": hours}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching noise floor stats: {e}")
             return self._error(e)
@@ -5204,27 +5218,42 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def crc_error_count(self, hours: int = 24):
-        """Return total CRC errors within the given time window."""
+    def crc_error_count(self, hours: int = 24, radio_id: str = None):
+        """Return total CRC errors within the given time window, or for one radio."""
         try:
             storage = self._get_storage()
             hours = int(hours)
-            count = storage.get_crc_error_count(hours=hours)
-            return self._success({"crc_error_count": count, "hours": hours})
+            count = storage.get_crc_error_count(hours=hours, radio_id=radio_id or None)
+            payload = {"crc_error_count": count, "hours": hours}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching CRC error count: {e}")
             return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def crc_error_history(self, hours: int = 24, limit: int = None):
-        """Return CRC error records within the given time window."""
+    def crc_error_history(self, hours: int = 24, limit: int = None, radio_id: str = None):
+        """Return CRC error records within the given time window.
+
+        On a node with two or more radios each row names the radio whose counter
+        the errors came from; ``radio_id`` narrows the series to one radio.
+        """
         try:
             storage = self._get_storage()
             hours = int(hours)
             limit = int(limit) if limit else None
-            history = storage.get_crc_error_history(hours=hours, limit=limit)
-            return self._success({"history": history, "hours": hours, "count": len(history)})
+            history = storage.get_crc_error_history(
+                hours=hours,
+                limit=limit,
+                radio_id=radio_id or None,
+                radio_profiles=self._active_radio_profiles(),
+            )
+            payload = {"history": history, "hours": hours, "count": len(history)}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching CRC error history: {e}")
             return self._error(e)

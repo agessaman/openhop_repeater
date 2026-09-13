@@ -1425,7 +1425,12 @@ paths:
     get:
       tags: [Noise Floor]
       summary: Get noise floor history
-      description: Retrieve historical noise floor measurements
+      description: >-
+        Historical noise floor measurements, oldest first. On a node with two or more
+        radios every sample names the radio it was read from, and radio_id pages that
+        radio's samples on their own; offset paging over the combined series is stable
+        only while nothing is filtered out. Samples stored before per-radio sampling,
+        and every sample on a single-radio node, carry no radio id.
       parameters:
         - name: hours
           in: query
@@ -1435,6 +1440,24 @@ paths:
             minimum: 1
             maximum: 168
           description: Time range in hours
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000000
+          description: Maximum samples to return. Defaults to 300 per hour, at least 2000.
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: radio_id
+          in: query
+          schema:
+            type: string
+          description: Return only samples read from this radio.
       responses:
         '200':
           description: Noise floor history
@@ -1446,15 +1469,32 @@ paths:
                   success:
                     type: boolean
                   data:
-                    type: array
-                    items:
-                      type: object
+                    type: object
+                    properties:
+                      history:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/NoiseFloorSample'
+                      hours:
+                        type: integer
+                      count:
+                        type: integer
+                      limit:
+                        type: integer
+                      offset:
+                        type: integer
+                      radio_id:
+                        type: string
+                        description: Echoed back only when the request named a radio.
 
   /noise_floor_stats:
     get:
       tags: [Noise Floor]
       summary: Get noise floor statistics
-      description: Statistical analysis of noise floor measurements
+      description: >-
+        Statistical analysis of noise floor measurements. Without radio_id on a node
+        with two or more radios this averages two receivers on two bands, which
+        describes neither; name a radio there.
       parameters:
         - name: hours
           in: query
@@ -1462,6 +1502,11 @@ paths:
             type: integer
             default: 24
           description: Time range in hours
+        - name: radio_id
+          in: query
+          schema:
+            type: string
+          description: Summarise only samples read from this radio.
       responses:
         '200':
           description: Noise floor statistics
@@ -1475,14 +1520,24 @@ paths:
                   data:
                     type: object
                     properties:
-                      min:
-                        type: number
-                      max:
-                        type: number
-                      avg:
-                        type: number
-                      current:
-                        type: number
+                      stats:
+                        type: object
+                        properties:
+                          measurement_count:
+                            type: integer
+                          avg_noise_floor:
+                            type: number
+                          min_noise_floor:
+                            type: number
+                          max_noise_floor:
+                            type: number
+                          hours:
+                            type: integer
+                      hours:
+                        type: integer
+                      radio_id:
+                        type: string
+                        description: Echoed back only when the request named a radio.
 
   /noise_floor_chart_data:
     get:
@@ -4043,12 +4098,21 @@ paths:
     get:
       tags: [System]
       summary: Get CRC error count
+      description: >-
+        Total CRC errors in the window. radio_id narrows it to one radio's counter;
+        errors recorded before per-radio sampling carry no radio id and are counted
+        only by the unfiltered call.
       parameters:
         - name: hours
           in: query
           schema:
             type: integer
             default: 24
+        - name: radio_id
+          in: query
+          schema:
+            type: string
+          description: Count only errors from this radio's counter.
       responses:
         '200':
           description: CRC error count
@@ -4056,11 +4120,27 @@ paths:
             application/json:
               schema:
                 type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      crc_error_count:
+                        type: integer
+                      hours:
+                        type: integer
+                      radio_id:
+                        type: string
+                        description: Echoed back only when the request named a radio.
 
   /crc_error_history:
     get:
       tags: [System]
       summary: Get CRC error history
+      description: >-
+        CRC error batches in the window, oldest first. On a node with two or more
+        radios every batch names the radio whose counter it came from.
       parameters:
         - name: hours
           in: query
@@ -4071,6 +4151,11 @@ paths:
           in: query
           schema:
             type: integer
+        - name: radio_id
+          in: query
+          schema:
+            type: string
+          description: Return only errors from this radio's counter.
       responses:
         '200':
           description: CRC error records
@@ -4078,6 +4163,23 @@ paths:
             application/json:
               schema:
                 type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      history:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CrcErrorSample'
+                      hours:
+                        type: integer
+                      count:
+                        type: integer
+                      radio_id:
+                        type: string
+                        description: Echoed back only when the request named a radio.
 
   /memory_debug:
     get:
@@ -5516,6 +5618,36 @@ components:
           type: integer
         tx_count:
           type: integer
+
+    NoiseFloorSample:
+      type: object
+      properties:
+        timestamp:
+          type: number
+        noise_floor_dbm:
+          type: number
+        radio_id:
+          type: string
+          nullable: true
+          description: >-
+            The radio this sample was read from. Present only on a node with two or
+            more radios; null there for a sample stored before per-radio sampling or
+            read from a radio that is no longer configured.
+
+    CrcErrorSample:
+      type: object
+      properties:
+        timestamp:
+          type: number
+        count:
+          type: integer
+          description: Errors counted since the previous sample of this radio.
+        radio_id:
+          type: string
+          nullable: true
+          description: >-
+            The radio whose counter these errors came from. Present only on a node
+            with two or more radios.
 
     RadioPacketRateSeries:
       type: object

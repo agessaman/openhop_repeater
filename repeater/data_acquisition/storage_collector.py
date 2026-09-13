@@ -373,11 +373,26 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(advert_record, "advert")
         self._publish_to_glass(advert_record, "advert")
 
-    def record_noise_floor(self, noise_floor_dbm: float):
-        """Record noise floor to storage and defer network publishing to background tasks."""
-        self._last_noise_floor_dbm = noise_floor_dbm
+    def record_noise_floor(
+        self,
+        noise_floor_dbm: float,
+        radio_id: Optional[str] = None,
+        *,
+        publish: bool = True,
+    ):
+        """Record noise floor to storage and defer network publishing to background tasks.
+
+        ``radio_id`` is the radio the sample was read from, NULL on a
+        single-radio node. Only the default radio's sample is published: the
+        observer feed and Glass carry one noise floor per node, and doubling
+        that cadence is a change of its own (per-radio publishing is not in this
+        work). The published record keeps its existing shape.
+        """
         noise_record = {"timestamp": time.time(), "noise_floor_dbm": noise_floor_dbm}
-        self.sqlite_handler.store_noise_floor(noise_record)
+        self.sqlite_handler.store_noise_floor({**noise_record, "radio_id": radio_id})
+        if not publish:
+            return
+        self._last_noise_floor_dbm = noise_floor_dbm
         self._schedule_background(
             self._deferred_publish_noise_floor,
             noise_record,
@@ -396,10 +411,22 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(noise_record, "noise_floor")
         self._publish_to_glass(noise_record, "noise_floor")
 
-    def record_crc_errors(self, count: int):
-        """Record a batch of CRC errors detected since last poll and defer publishing."""
+    def record_crc_errors(
+        self,
+        count: int,
+        radio_id: Optional[str] = None,
+        *,
+        publish: bool = True,
+    ):
+        """Record a batch of CRC errors detected since last poll and defer publishing.
+
+        Publishing follows the same rule as ``record_noise_floor``: every radio's
+        delta is stored, only the default radio's is published.
+        """
         crc_record = {"timestamp": time.time(), "count": count}
-        self.sqlite_handler.store_crc_errors(crc_record)
+        self.sqlite_handler.store_crc_errors({**crc_record, "radio_id": radio_id})
+        if not publish:
+            return
         self._schedule_background(
             self._deferred_publish_crc_errors,
             crc_record,
@@ -418,11 +445,19 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(crc_record, "crc_errors")
         self._publish_to_glass(crc_record, "crc_errors")
 
-    def get_crc_error_count(self, hours: int = 24) -> int:
-        return self.sqlite_handler.get_crc_error_count(hours)
+    def get_crc_error_count(self, hours: int = 24, radio_id: Optional[str] = None) -> int:
+        return self.sqlite_handler.get_crc_error_count(hours, radio_id=radio_id)
 
-    def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
-        return self.sqlite_handler.get_crc_error_history(hours, limit)
+    def get_crc_error_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        return self.sqlite_handler.get_crc_error_history(
+            hours, limit, radio_id=radio_id, radio_profiles=radio_profiles
+        )
 
     def get_policy_event_counts(
         self,
@@ -655,11 +690,20 @@ class StorageCollector:
     def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
         self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
-        return self.sqlite_handler.get_noise_floor_history(hours, limit, offset)
+    def get_noise_floor_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        offset: int = 0,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        return self.sqlite_handler.get_noise_floor_history(
+            hours, limit, offset, radio_id=radio_id, radio_profiles=radio_profiles
+        )
 
-    def get_noise_floor_stats(self, hours: int = 24) -> dict:
-        return self.sqlite_handler.get_noise_floor_stats(hours)
+    def get_noise_floor_stats(self, hours: int = 24, radio_id: Optional[str] = None) -> dict:
+        return self.sqlite_handler.get_noise_floor_stats(hours, radio_id=radio_id)
 
     def close(self):
         # Stop the stats broadcast thread.

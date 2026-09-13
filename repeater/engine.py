@@ -8,7 +8,7 @@ from collections import OrderedDict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
 from openhop_core.protocol import Packet
@@ -262,7 +262,9 @@ class RepeaterHandler(BaseHandler):
         self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
         self._cached_noise_floor = None
-        self._last_crc_error_count = 0  # Track radio counter for delta persistence
+        # Radio hardware CRC counter per radio id (None on a single-radio node),
+        # so each radio's delta is measured against its own last reading.
+        self._crc_error_baselines: Dict[Optional[str], int] = {}
 
         # Cache transport keys for efficient lookup
         self._transport_keys_cache = None
@@ -2068,15 +2070,51 @@ class RepeaterHandler(BaseHandler):
         elif route in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
             self.sent_direct_count += 1
 
-    def get_noise_floor(self) -> Optional[float]:
+    @staticmethod
+    def _read_noise_floor(radio) -> Optional[float]:
+        """Read one radio's noise floor, or None when it cannot answer."""
         try:
-            radio = self.dispatcher.radio if self.dispatcher else None
-            if radio and hasattr(radio, "get_noise_floor"):
+            if radio is not None and hasattr(radio, "get_noise_floor"):
                 return radio.get_noise_floor()
             return None
         except Exception as e:
             logger.debug(f"Failed to get noise floor: {e}")
             return None
+
+    def get_noise_floor(self) -> Optional[float]:
+        """Noise floor of the default radio, which is what /stats reports."""
+        return self._read_noise_floor(self.dispatcher.radio if self.dispatcher else None)
+
+    def _sampling_radios(self) -> list:
+        """``(radio_id, radio)`` for every radio to sample, the default radio first.
+
+        A single-radio node yields one entry whose id is None: one radio needs no
+        label, so its stored rows and published records stay exactly as they
+        were. The default radio comes first because callers publish only the
+        first entry's sample — /stats, the MQTT status message and companion
+        stats all read the default radio's figures.
+        """
+        fabric, ids = self._fabric_endpoints()
+        default_radio = self.dispatcher.radio if self.dispatcher else None
+        if fabric is None or not ids or len(ids) < 2:
+            return [(None, default_radio)]
+
+        default_id = getattr(fabric, "default_radio_id", None)
+        if isinstance(default_id, str) and default_id in ids:
+            ids.remove(default_id)
+            ids.insert(0, default_id)
+
+        getter = getattr(fabric, "get_radio", None)
+        radios = []
+        for radio_id in ids:
+            radio = None
+            if getter is not None:
+                try:
+                    radio = getter(radio_id)
+                except Exception as e:
+                    logger.debug(f"No endpoint for radio {radio_id}: {e}")
+            radios.append((radio_id, radio))
+        return radios
 
     def get_cached_noise_floor(self) -> Optional[float]:
         """Return the last asynchronously-sampled noise floor value."""
@@ -2258,38 +2296,66 @@ class RepeaterHandler(BaseHandler):
             self._background_task = asyncio.create_task(self._background_timer_loop())
 
     async def _record_noise_floor_async(self):
+        """Sample every radio's noise floor and persist it against that radio.
+
+        One radio at a time: a KISS modem's read blocks for up to its response
+        timeout, and reading both at once would put two of those in flight while
+        the radios are also carrying traffic.
+        """
         if not self.storage:
             return
 
-        try:
-            # Run in executor so KISS modem's blocking _send_command (up to 5s timeout)
-            # does not block the event loop and hang the process / delay Ctrl+C.
-            loop = asyncio.get_running_loop()
-            noise_floor = await loop.run_in_executor(None, self.get_noise_floor)
-            if noise_floor is not None:
-                self._cached_noise_floor = noise_floor
-                self.storage.record_noise_floor(noise_floor)
-                logger.debug(f"Recorded noise floor: {noise_floor} dBm")
-            else:
-                logger.debug("Unable to read noise floor from radio")
-        except Exception as e:
-            logger.error(f"Error recording noise floor: {e}")
+        loop = asyncio.get_running_loop()
+        for index, (radio_id, radio) in enumerate(self._sampling_radios()):
+            is_default = index == 0
+            try:
+                # Run in executor so KISS modem's blocking _send_command (up to 5s timeout)
+                # does not block the event loop and hang the process / delay Ctrl+C.
+                noise_floor = await loop.run_in_executor(
+                    None, self._read_noise_floor_for, radio_id, radio
+                )
+                if noise_floor is None:
+                    logger.debug("Unable to read noise floor from radio %s", radio_id or "default")
+                    continue
+                if is_default:
+                    self._cached_noise_floor = noise_floor
+                self.storage.record_noise_floor(noise_floor, radio_id, publish=is_default)
+                logger.debug(f"Recorded noise floor: {noise_floor} dBm ({radio_id or 'default'})")
+            except Exception as e:
+                logger.error(f"Error recording noise floor: {e}")
+
+    def _read_noise_floor_for(self, radio_id: Optional[str], radio) -> Optional[float]:
+        """Read the noise floor of one sampled radio.
+
+        The default radio goes through ``get_noise_floor`` so everything that
+        reports it reads the same path.
+        """
+        if radio_id is None:
+            return self.get_noise_floor()
+        return self._read_noise_floor(radio)
 
     async def _record_crc_errors_async(self):
-        """Persist CRC error delta from the radio hardware counter."""
+        """Persist each radio's CRC error delta from its hardware counter.
+
+        Baselines are per radio: a shared one would charge every radio's errors
+        to whichever was sampled last and report swings that never happened.
+        """
         if not self.storage:
             return
 
-        try:
-            radio = self.dispatcher.radio if self.dispatcher else None
-            current = getattr(radio, "crc_error_count", 0) if radio else 0
-            delta = current - self._last_crc_error_count
-            if delta > 0:
-                self.storage.record_crc_errors(delta)
-                logger.debug(f"Recorded {delta} CRC errors (total: {current})")
-            self._last_crc_error_count = current
-        except Exception as e:
-            logger.error(f"Error recording CRC errors: {e}")
+        for index, (radio_id, radio) in enumerate(self._sampling_radios()):
+            try:
+                current = int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
+                delta = current - self._crc_error_baselines.get(radio_id, 0)
+                if delta > 0:
+                    self.storage.record_crc_errors(delta, radio_id, publish=index == 0)
+                    logger.debug(
+                        f"Recorded {delta} CRC errors (total: {current}, "
+                        f"radio {radio_id or 'default'})"
+                    )
+                self._crc_error_baselines[radio_id] = current
+            except Exception as e:
+                logger.error(f"Error recording CRC errors: {e}")
 
     async def _send_periodic_advert_async(self):
         logger.info(

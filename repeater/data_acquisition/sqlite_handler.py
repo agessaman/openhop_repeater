@@ -119,6 +119,74 @@ NEIGHBOR_HISTORY_BUCKETS_BY_RADIO_QUERY = """
     LIMIT ?
 """
 
+# Noise floor and CRC error samples. Each variant is a fixed query: concatenating
+# a radio filter trips bandit B608, and naming the radio in its own query also
+# lets the planner reach for idx_noise_radio_time / idx_crc_radio_time instead of
+# scanning the whole window and discarding the other radio's rows.
+NOISE_FLOOR_HISTORY_QUERY = """
+    SELECT timestamp, noise_floor_dbm, radio_id
+    FROM noise_floor
+    WHERE timestamp > ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+    OFFSET ?
+"""
+
+NOISE_FLOOR_HISTORY_BY_RADIO_QUERY = """
+    SELECT timestamp, noise_floor_dbm, radio_id
+    FROM noise_floor INDEXED BY idx_noise_radio_time
+    WHERE radio_id = ?
+      AND timestamp > ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+    OFFSET ?
+"""
+
+NOISE_FLOOR_STATS_QUERY = """
+    SELECT
+        COUNT(*) as measurement_count,
+        AVG(noise_floor_dbm) as avg_noise_floor,
+        MIN(noise_floor_dbm) as min_noise_floor,
+        MAX(noise_floor_dbm) as max_noise_floor
+    FROM noise_floor
+    WHERE timestamp > ?
+"""
+
+NOISE_FLOOR_STATS_BY_RADIO_QUERY = """
+    SELECT
+        COUNT(*) as measurement_count,
+        AVG(noise_floor_dbm) as avg_noise_floor,
+        MIN(noise_floor_dbm) as min_noise_floor,
+        MAX(noise_floor_dbm) as max_noise_floor
+    FROM noise_floor INDEXED BY idx_noise_radio_time
+    WHERE radio_id = ?
+      AND timestamp > ?
+"""
+
+CRC_ERROR_HISTORY_QUERY = """
+    SELECT timestamp, count, radio_id
+    FROM crc_errors
+    WHERE timestamp > ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+"""
+
+CRC_ERROR_HISTORY_BY_RADIO_QUERY = """
+    SELECT timestamp, count, radio_id
+    FROM crc_errors INDEXED BY idx_crc_radio_time
+    WHERE radio_id = ?
+      AND timestamp > ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+"""
+
+CRC_ERROR_COUNT_QUERY = "SELECT COALESCE(SUM(count), 0) FROM crc_errors WHERE timestamp > ?"
+
+CRC_ERROR_COUNT_BY_RADIO_QUERY = (
+    "SELECT COALESCE(SUM(count), 0) FROM crc_errors INDEXED BY idx_crc_radio_time "
+    "WHERE radio_id = ? AND timestamp > ?"
+)
+
 ROUTE_NAMES = {0: "Transport Flood", 1: "Flood", 2: "Direct", 3: "Transport Direct"}
 
 
@@ -439,7 +507,8 @@ class SQLiteHandler:
                     CREATE TABLE IF NOT EXISTS noise_floor (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp REAL NOT NULL,
-                        noise_floor_dbm REAL NOT NULL
+                        noise_floor_dbm REAL NOT NULL,
+                        radio_id TEXT
                     )
                 """
                 )
@@ -449,7 +518,8 @@ class SQLiteHandler:
                     CREATE TABLE IF NOT EXISTS crc_errors (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp REAL NOT NULL,
-                        count INTEGER NOT NULL DEFAULT 1
+                        count INTEGER NOT NULL DEFAULT 1,
+                        radio_id TEXT
                     )
                 """
                 )
@@ -1140,6 +1210,46 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 19: attribute noise floor and CRC samples to the radio
+                # they were read from. Rows written before this, and every row on a
+                # single-radio node, stay NULL: one radio needs no label, and
+                # labelling old rows would claim an attribution nobody measured.
+                migration_name = "add_radio_id_to_rf_samples"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(noise_floor)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "radio_id" not in columns:
+                        conn.execute("ALTER TABLE noise_floor ADD COLUMN radio_id TEXT")
+                        logger.info("Added radio_id column to noise_floor table")
+
+                    cursor = conn.execute("PRAGMA table_info(crc_errors)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "radio_id" not in columns:
+                        conn.execute("ALTER TABLE crc_errors ADD COLUMN radio_id TEXT")
+                        logger.info("Added radio_id column to crc_errors table")
+
+                    # Covering indexes: the per-radio history and stats queries read
+                    # only these columns, so one radio's series never touches the
+                    # other's rows. Created here rather than beside the other
+                    # indexes because radio_id does not exist until the ALTERs above.
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_noise_radio_time "
+                        "ON noise_floor(radio_id, timestamp, noise_floor_dbm)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_crc_radio_time "
+                        "ON crc_errors(radio_id, timestamp, count)"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -1516,14 +1626,19 @@ class SQLiteHandler:
             logger.error(f"Failed to store advert in SQLite: {e}")
 
     def store_noise_floor(self, record: dict):
+        """Store one noise floor sample. ``radio_id`` is NULL on a single-radio node."""
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO noise_floor (timestamp, noise_floor_dbm)
-                    VALUES (?, ?)
+                    INSERT INTO noise_floor (timestamp, noise_floor_dbm, radio_id)
+                    VALUES (?, ?, ?)
                 """,
-                    (record.get("timestamp", time.time()), record.get("noise_floor_dbm")),
+                    (
+                        record.get("timestamp", time.time()),
+                        record.get("noise_floor_dbm"),
+                        record.get("radio_id"),
+                    ),
                 )
         except Exception as e:
             logger.error(f"Failed to store noise floor in SQLite: {e}")
@@ -1534,44 +1649,72 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO crc_errors (timestamp, count)
-                    VALUES (?, ?)
+                    INSERT INTO crc_errors (timestamp, count, radio_id)
+                    VALUES (?, ?, ?)
                 """,
-                    (record.get("timestamp", time.time()), record.get("count", 1)),
+                    (
+                        record.get("timestamp", time.time()),
+                        record.get("count", 1),
+                        record.get("radio_id"),
+                    ),
                 )
         except Exception as e:
             logger.error(f"Failed to store CRC errors in SQLite: {e}")
 
-    def get_crc_error_count(self, hours: int = 24) -> int:
-        """Return total CRC errors within the given time window."""
+    def get_crc_error_count(self, hours: int = 24, radio_id: Optional[str] = None) -> int:
+        """Return total CRC errors within the given time window.
+
+        ``radio_id`` narrows the count to samples read from that radio. Samples
+        stored before per-radio sampling, and every sample on a single-radio
+        node, carry no radio id and so are counted only by the unfiltered call.
+        """
         try:
             cutoff = time.time() - (hours * 3600)
             with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(count), 0) FROM crc_errors WHERE timestamp > ?", (cutoff,)
-                ).fetchone()
+                if radio_id:
+                    row = conn.execute(
+                        CRC_ERROR_COUNT_BY_RADIO_QUERY, (str(radio_id), cutoff)
+                    ).fetchone()
+                else:
+                    row = conn.execute(CRC_ERROR_COUNT_QUERY, (cutoff,)).fetchone()
                 return row[0] if row else 0
         except Exception as e:
             logger.error(f"Failed to get CRC error count: {e}")
             return 0
 
-    def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
-        """Return CRC error records within the given time window (chronological)."""
+    def get_crc_error_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        """Return CRC error records within the given time window (chronological).
+
+        Rows carry ``radio_id`` only on a node with two or more radios, so a
+        single-radio response is byte-for-byte what it was before per-radio
+        sampling.
+        """
         try:
             cutoff = time.time() - (hours * 3600)
             if limit is None:
                 limit = 1000
+            resolver = RadioResolver(radio_profiles)
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
-                query = """
-                    SELECT timestamp, count
-                    FROM crc_errors
-                    WHERE timestamp > ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                """
-                rows = conn.execute(query, (cutoff, int(limit))).fetchall()
-                return [{"timestamp": r["timestamp"], "count": r["count"]} for r in reversed(rows)]
+                if radio_id:
+                    rows = conn.execute(
+                        CRC_ERROR_HISTORY_BY_RADIO_QUERY, (str(radio_id), cutoff, int(limit))
+                    ).fetchall()
+                else:
+                    rows = conn.execute(CRC_ERROR_HISTORY_QUERY, (cutoff, int(limit))).fetchall()
+                history = []
+                for row in reversed(rows):
+                    entry = {"timestamp": row["timestamp"], "count": row["count"]}
+                    if resolver.multi:
+                        entry["radio_id"] = resolver.resolve(row["radio_id"])
+                    history.append(entry)
+                return history
         except Exception as e:
             logger.error(f"Failed to get CRC error history: {e}")
             return []
@@ -3237,7 +3380,21 @@ class SQLiteHandler:
             logger.error(f"Failed to get neighbors: {e}")
             return {}
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
+    def get_noise_floor_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        offset: int = 0,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        """Return noise floor samples within the window, oldest first.
+
+        ``radio_id`` pages one radio's samples on their own, which is what keeps
+        offset paging stable: interleaved radios would shift a page's contents
+        every time the other radio sampled. Rows carry ``radio_id`` only on a
+        node with two or more radios.
+        """
         try:
             cutoff = time.time() - (hours * 3600)
 
@@ -3246,26 +3403,31 @@ class SQLiteHandler:
             else:
                 limit = max(1, min(1_000_000, int(limit)))
             offset = max(0, int(offset))
+            resolver = RadioResolver(radio_profiles)
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                query = """
-                    SELECT timestamp, noise_floor_dbm
-                    FROM noise_floor
-                    WHERE timestamp > ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    OFFSET ?
-                """
-
-                measurements = conn.execute(query, (cutoff, int(limit), offset)).fetchall()
+                if radio_id:
+                    measurements = conn.execute(
+                        NOISE_FLOOR_HISTORY_BY_RADIO_QUERY,
+                        (str(radio_id), cutoff, int(limit), offset),
+                    ).fetchall()
+                else:
+                    measurements = conn.execute(
+                        NOISE_FLOOR_HISTORY_QUERY, (cutoff, int(limit), offset)
+                    ).fetchall()
 
                 # Reverse to get chronological order (oldest to newest)
-                result = [
-                    {"timestamp": row["timestamp"], "noise_floor_dbm": row["noise_floor_dbm"]}
-                    for row in reversed(measurements)
-                ]
+                result = []
+                for row in reversed(measurements):
+                    entry = {
+                        "timestamp": row["timestamp"],
+                        "noise_floor_dbm": row["noise_floor_dbm"],
+                    }
+                    if resolver.multi:
+                        entry["radio_id"] = resolver.resolve(row["radio_id"])
+                    result.append(entry)
 
                 return result
 
@@ -3273,25 +3435,25 @@ class SQLiteHandler:
             logger.error(f"Failed to get noise floor history: {e}")
             return []
 
-    def get_noise_floor_stats(self, hours: int = 24) -> dict:
+    def get_noise_floor_stats(self, hours: int = 24, radio_id: Optional[str] = None) -> dict:
+        """Summarise the noise floor over the window, optionally for one radio.
+
+        Without ``radio_id`` on a bridge this averages two receivers on two
+        bands, which is a number about nothing in particular; the RF Health page
+        always names a radio there.
+        """
         try:
             cutoff = time.time() - (hours * 3600)
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                stats = conn.execute(
-                    """
-                    SELECT
-                        COUNT(*) as measurement_count,
-                        AVG(noise_floor_dbm) as avg_noise_floor,
-                        MIN(noise_floor_dbm) as min_noise_floor,
-                        MAX(noise_floor_dbm) as max_noise_floor
-                    FROM noise_floor
-                    WHERE timestamp > ?
-                """,
-                    (cutoff,),
-                ).fetchone()
+                if radio_id:
+                    stats = conn.execute(
+                        NOISE_FLOOR_STATS_BY_RADIO_QUERY, (str(radio_id), cutoff)
+                    ).fetchone()
+                else:
+                    stats = conn.execute(NOISE_FLOOR_STATS_QUERY, (cutoff,)).fetchone()
 
                 return {
                     "measurement_count": stats["measurement_count"],
