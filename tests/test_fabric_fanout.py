@@ -290,6 +290,71 @@ async def test_own_transmission_heard_on_the_other_radio_is_not_a_neighbour():
 
 
 @pytest.mark.asyncio
+async def test_a_copy_heard_on_the_radio_that_sent_it_is_not_our_echo():
+    """A radio cannot hear its own transmission, so that copy came from a neighbour."""
+    rig = _Rig()  # bridge only: heard on local, sent on link
+    payload = b"\x51\x52\x53"
+    assert await rig.handler(_flood(payload=payload, path=b"\x11", rx="local"), _rx("local"))
+    assert rig.air.order == ["link"]
+
+    collided = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH]), rx="link")
+    assert await rig.handler(collided, _rx("link")) is False
+    assert f"1:{LOCAL_HASH:02X}" in rig.handler.neighbour_link_tracker.links
+
+    echo = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH]), rx="local")
+    rig.handler.neighbour_link_tracker.links.clear()
+    assert await rig.handler(echo, _rx("local")) is False
+    assert f"1:{LOCAL_HASH:02X}" not in rig.handler.neighbour_link_tracker.links
+
+
+@pytest.mark.asyncio
+async def test_a_matching_copy_after_the_echo_window_is_a_neighbour():
+    rig = _Rig({"repeat_on_ingress": True})
+    rig.handler.OWN_ECHO_MARGIN_SECONDS = -1.0  # every finished send is already outside it
+    payload = b"\x61\x62\x63"
+    assert await rig.handler(_flood(payload=payload, path=b"\x11", rx="local"), _rx("local"))
+
+    late = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH]), rx="link")
+    assert await rig.handler(late, _rx("link")) is False
+
+    assert f"1:{LOCAL_HASH:02X}" in rig.handler.neighbour_link_tracker.links
+    assert not rig.handler._recent_own_tx  # expired sends are dropped
+
+
+@pytest.mark.asyncio
+async def test_a_send_refused_by_duty_cycle_leaves_no_echo_to_match():
+    rig = _Rig({"repeat_on_ingress": True})
+    rig.handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 5.0))
+    payload = b"\x71\x72\x73"
+    assert (
+        await rig.handler(_flood(payload=payload, path=b"\x11", rx="local"), _rx("local")) is False
+    )
+    assert rig.air.frames == []
+
+    collided = _flood(payload=payload, path=bytes([0x11, LOCAL_HASH]), rx="link")
+    assert await rig.handler(collided, _rx("link")) is False
+
+    assert not rig.handler._recent_own_tx
+    assert f"1:{LOCAL_HASH:02X}" in rig.handler.neighbour_link_tracker.links
+
+
+@pytest.mark.asyncio
+async def test_a_failed_send_is_forgotten():
+    rig = _Rig()
+    rig.link.fail = True
+    assert await rig.handler(_flood(path=b"\x11", rx="local"), _rx("local")) is False
+    assert not rig.handler._recent_own_tx
+
+
+@pytest.mark.asyncio
+async def test_a_single_radio_node_keeps_no_echo_records():
+    rig = _Rig()
+    with patch.object(rig.handler, "_fabric_endpoints", return_value=(None, ["local"])):
+        assert await rig.handler(_flood(path=b"\x11", rx="local"), _rx("local"))
+    assert not rig.handler._recent_own_tx
+
+
+@pytest.mark.asyncio
 async def test_egress_follows_captured_ingress_not_the_latest_rx():
     rig = _Rig({"repeat_on_ingress": True})
     rig.handler._calculate_tx_delay = lambda packet, snr=0.0: 0.05

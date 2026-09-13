@@ -208,9 +208,9 @@ class RepeaterHandler(BaseHandler):
             config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
         )
         self.neighbour_link_tracker = NeighbourLinkTracker(config)
-        # (packet hash, path) of recent transmissions. Two radios sharing one
-        # frequency hear each other send; that echo ends in our own path hash and
-        # must not make this node its own neighbour.
+        # (packet hash, path) -> recent physical sends, each with its radio and
+        # timing. Two radios sharing one frequency hear each other send; that echo
+        # ends in our own path hash and must not make this node its own neighbour.
         self._recent_own_tx: OrderedDict = OrderedDict()
 
         radio = dispatcher.radio if dispatcher else None
@@ -405,7 +405,7 @@ class RepeaterHandler(BaseHandler):
                 self.radio_config["coding_rate"],
                 self.radio_config["preamble_length"],
             ).score
-            if not self._is_own_echo(pkt_hash_full, original_path_hashes):
+            if not self._is_own_echo(pkt_hash_full, original_path_hashes, rx_radio_id):
                 self.neighbour_link_tracker.observe(
                     packet,
                     route_type=route_type,
@@ -443,9 +443,6 @@ class RepeaterHandler(BaseHandler):
 
             # Capture the forwarded path (after modification)
             forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
-            # Before the first send: an echo can arrive while a later egress of
-            # the same fan-out is still on the air.
-            self._note_own_transmission(pkt_hash_full, forwarded_path_hashes)
 
             # MeshCore queues multi-ack redundancy copies ahead of the primary
             # ACK at the same scheduled time, so create their TX tasks first.
@@ -749,34 +746,83 @@ class RepeaterHandler(BaseHandler):
             return
         self._append_recent_packet(packet_record)
 
-    OWN_ECHO_TTL_SECONDS = 30.0
+    # Another radio of this node hears a send only while it is on the air or
+    # shortly after, allowing for a remote modem's delivery delay.
+    OWN_ECHO_MARGIN_SECONDS = 2.0
+    # A send that never reports back stops counting after this long.
+    OWN_ECHO_INFLIGHT_LIMIT_SECONDS = 60.0
     OWN_ECHO_MAX_ENTRIES = 256
 
-    def _note_own_transmission(self, packet_hash: str, path_hashes) -> None:
-        """Remember a packet about to be sent, so its echo can be recognised."""
+    def _note_own_send_started(self, packet: Packet, radio_id: Optional[str]):
+        """Record a physical send about to go on air; return a handle for its outcome.
+
+        Only on a node with two or more radios: a lone radio cannot hear itself.
+        """
+        _, radio_ids = self._fabric_endpoints()
+        if not radio_ids or len(radio_ids) < 2:
+            return None
+        path_hashes = packet.get_path_hashes_hex()
         if not path_hashes:
-            return
-        key = (packet_hash, tuple(path_hashes))
-        self._recent_own_tx.pop(key, None)
-        self._recent_own_tx[key] = time.monotonic()
+            return None
+        key = (packet.calculate_packet_hash().hex().upper(), tuple(path_hashes))
+        record = {"radio_id": radio_id, "started": time.monotonic(), "finished": None}
+        sends = self._recent_own_tx.pop(key, [])
+        sends.append(record)
+        self._recent_own_tx[key] = sends
         while len(self._recent_own_tx) > self.OWN_ECHO_MAX_ENTRIES:
             self._recent_own_tx.popitem(last=False)
+        return key, record
 
-    def _is_own_echo(self, packet_hash: str, path_hashes) -> bool:
-        """True when a reception carries exactly the path this node just sent.
+    def _note_own_send_finished(self, handle, packet: Packet, *, sent: bool) -> None:
+        """Close a send: keep it for its echo window, or forget it if nothing went on air."""
+        if handle is None:
+            return
+        key, record = handle
+        if record["finished"] is not None:
+            return
+        record["finished"] = time.monotonic()
+        if not sent:
+            sends = [r for r in self._recent_own_tx.get(key, []) if r is not record]
+            if sends:
+                self._recent_own_tx[key] = sends
+            else:
+                self._recent_own_tx.pop(key, None)
+            return
+        if record["radio_id"] is None:
+            metadata = getattr(packet, "_tx_metadata", None)
+            if isinstance(metadata, dict):
+                record["radio_id"] = metadata.get("radio_id") or metadata.get("tx_radio_id")
 
-        A neighbour repeating our copy appends its own hash, so only our own
-        transmission, heard by a second radio on the same frequency, matches.
+    def _own_send_is_live(self, record: dict, now: float) -> bool:
+        if record["finished"] is None:
+            return now - record["started"] <= self.OWN_ECHO_INFLIGHT_LIMIT_SECONDS
+        return now - record["finished"] <= self.OWN_ECHO_MARGIN_SECONDS
+
+    def _is_own_echo(self, packet_hash: str, path_hashes, rx_radio_id) -> bool:
+        """True when another radio of this node is hearing our own transmission.
+
+        The reception must carry exactly the path we sent, arrive on a radio other
+        than the one that sent it, and arrive while that send is on the air or
+        within OWN_ECHO_MARGIN_SECONDS of it finishing. A neighbour repeating our
+        copy appends its own hash; one whose 1-byte hash collides with ours is only
+        mistaken for an echo if it repeats the same packet on the same path inside
+        that window.
         """
-        if not path_hashes or not self._recent_own_tx:
+        if rx_radio_id is None or not path_hashes or not self._recent_own_tx:
             return False
         now = time.monotonic()
         while self._recent_own_tx:
-            oldest = next(iter(self._recent_own_tx.values()))
-            if now - oldest <= self.OWN_ECHO_TTL_SECONDS:
+            sends = next(iter(self._recent_own_tx.values()))
+            if any(self._own_send_is_live(record, now) for record in sends):
                 break
             self._recent_own_tx.popitem(last=False)
-        return (packet_hash, tuple(path_hashes)) in self._recent_own_tx
+        for record in self._recent_own_tx.get((packet_hash, tuple(path_hashes)), ()):
+            if not self._own_send_is_live(record, now):
+                continue
+            sender = record["radio_id"]
+            if sender is None or str(sender) != str(rx_radio_id):
+                return True
+        return False
 
     def record_duplicate(self, packet: Packet, rssi: int = 0, snr: float = 0.0) -> None:
         """Record a known-duplicate packet for UI/storage visibility without forwarding.
@@ -812,7 +858,8 @@ class RepeaterHandler(BaseHandler):
             self.radio_config["coding_rate"],
             self.radio_config["preamble_length"],
         ).score
-        if not self._is_own_echo(pkt_hash_full, original_path_hashes):
+        rx_radio_id = getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+        if not self._is_own_echo(pkt_hash_full, original_path_hashes, rx_radio_id):
             self.neighbour_link_tracker.observe(
                 packet,
                 route_type=route_type,
@@ -821,9 +868,7 @@ class RepeaterHandler(BaseHandler):
                 snr=float(snr),
                 score=score,
                 is_duplicate=True,
-                rx_radio_id=(
-                    getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
-                ),
+                rx_radio_id=rx_radio_id,
             )
 
         packet_record = self._build_packet_record(
@@ -1780,6 +1825,9 @@ class RepeaterHandler(BaseHandler):
                             )
                             return False
 
+                    # Registered as the send starts: another radio of this node can
+                    # hear it while it is still on the air.
+                    own_send = self._note_own_send_started(fwd_pkt, preferred_tx_radio_id)
                     try:
                         if preferred_tx_radio_id:
                             try:
@@ -1794,6 +1842,7 @@ class RepeaterHandler(BaseHandler):
                                 )
                         else:
                             sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        self._note_own_send_finished(own_send, fwd_pkt, sent=bool(sent))
                         if not sent:
                             logger.warning(
                                 "Retransmit failed (attempt %d): dispatcher returned false",
@@ -1812,6 +1861,7 @@ class RepeaterHandler(BaseHandler):
                         )
                         return True
                     except Exception as e:
+                        self._note_own_send_finished(own_send, fwd_pkt, sent=False)
                         logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
                         if local_transmission and attempt == 0:
                             pass  # release lock, outer loop sleeps, then retries

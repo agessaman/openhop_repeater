@@ -17,6 +17,7 @@ or:
 import asyncio
 import time
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -61,6 +62,7 @@ def _make_handler():
     h.airtime_mgr.can_transmit.return_value = (True, 0.0)
     h.airtime_mgr.calculate_airtime.return_value = 100.0
     h._tx_lock = asyncio.Lock()
+    h._recent_own_tx = OrderedDict()
     h.sent_flood_count = 0
     h.sent_direct_count = 0
     # Stub out _record_packet_sent so it doesn't touch packet.header constants
