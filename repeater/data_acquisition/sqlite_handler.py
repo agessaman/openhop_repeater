@@ -57,6 +57,68 @@ PACKET_STATS_BY_RADIO_QUERY = """
     GROUP BY rx_radio_id, transmitted, tx_radio_id, tx_radio_ids
 """
 
+# Neighbour history. A NULL radio parameter disables the rx_radio_id filter, so
+# each variant stays one fixed query rather than SQL assembled per call.
+NEIGHBOR_HISTORY_ROWS_QUERY = """
+    SELECT
+        timestamp,
+        rssi,
+        snr,
+        score,
+        is_duplicate,
+        packet_hash,
+        type,
+        route,
+        original_path,
+        rx_radio_id
+    FROM packets INDEXED BY idx_packets_upstream_time
+    WHERE upstream_hash = ?
+      AND upstream_hash_size = ?
+      AND timestamp >= ?
+      AND (? IS NULL OR rx_radio_id = ?)
+    ORDER BY timestamp DESC
+    LIMIT ?
+"""
+
+NEIGHBOR_HISTORY_BUCKETS_QUERY = """
+    SELECT
+        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+        COUNT(*) AS n,
+        SUM(is_duplicate) AS dup,
+        MAX(timestamp) AS last_ts,
+        AVG(score) AS score,
+        AVG(rssi) AS rssi,
+        AVG(snr) AS snr
+    FROM packets INDEXED BY idx_packets_upstream_time
+    WHERE upstream_hash = ?
+      AND upstream_hash_size = ?
+      AND timestamp >= ?
+      AND (? IS NULL OR rx_radio_id = ?)
+    GROUP BY bucket_ts
+    ORDER BY bucket_ts DESC
+    LIMIT ?
+"""
+
+NEIGHBOR_HISTORY_BUCKETS_BY_RADIO_QUERY = """
+    SELECT
+        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+        rx_radio_id,
+        COUNT(*) AS n,
+        SUM(is_duplicate) AS dup,
+        MAX(timestamp) AS last_ts,
+        AVG(score) AS score,
+        AVG(rssi) AS rssi,
+        AVG(snr) AS snr
+    FROM packets INDEXED BY idx_packets_upstream_time
+    WHERE upstream_hash = ?
+      AND upstream_hash_size = ?
+      AND timestamp >= ?
+      AND (? IS NULL OR rx_radio_id = ?)
+    GROUP BY bucket_ts, rx_radio_id
+    ORDER BY bucket_ts DESC, rx_radio_id DESC
+    LIMIT ?
+"""
+
 ROUTE_NAMES = {0: "Transport Flood", 1: "Flood", 2: "Direct", 3: "Transport Direct"}
 
 
@@ -2847,34 +2909,9 @@ class SQLiteHandler:
                         by_radio=by_radio,
                     )
 
-                params = [normalized_hash, path_hash_size, cutoff]
-                if radio_id:
-                    params.append(radio_id)
-                params.append(limit)
                 rows = conn.execute(
-                    """
-                    SELECT
-                        timestamp,
-                        rssi,
-                        snr,
-                        score,
-                        is_duplicate,
-                        packet_hash,
-                        type,
-                        route,
-                        original_path,
-                        rx_radio_id
-                    FROM packets INDEXED BY idx_packets_upstream_time
-                    WHERE upstream_hash = ?
-                      AND upstream_hash_size = ?
-                      AND timestamp >= ?
-                    """
-                    + ("  AND rx_radio_id = ?\n" if radio_id else "")
-                    + """
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    params,
+                    NEIGHBOR_HISTORY_ROWS_QUERY,
+                    (normalized_hash, path_hash_size, cutoff, radio_id, radio_id, limit),
                 ).fetchall()
 
                 history = []
@@ -2923,36 +2960,21 @@ class SQLiteHandler:
         by_radio: bool = False,
     ) -> list:
         bucket_seconds = max(1, bucket_seconds)
-        params = [bucket_seconds, bucket_seconds, peer_hash, path_hash_size, cutoff]
-        if radio_id:
-            params.append(radio_id)
-        params.append(limit)
+        query = (
+            NEIGHBOR_HISTORY_BUCKETS_BY_RADIO_QUERY if by_radio else NEIGHBOR_HISTORY_BUCKETS_QUERY
+        )
         rows = conn.execute(
-            """
-            SELECT
-                CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
-            """
-            + ("    rx_radio_id,\n" if by_radio else "")
-            + """
-                COUNT(*) AS n,
-                SUM(is_duplicate) AS dup,
-                MAX(timestamp) AS last_ts,
-                AVG(score) AS score,
-                AVG(rssi) AS rssi,
-                AVG(snr) AS snr
-            FROM packets INDEXED BY idx_packets_upstream_time
-            WHERE upstream_hash = ?
-              AND upstream_hash_size = ?
-              AND timestamp >= ?
-            """
-            + ("  AND rx_radio_id = ?\n" if radio_id else "")
-            + (
-                "GROUP BY bucket_ts, rx_radio_id ORDER BY bucket_ts DESC, rx_radio_id DESC\n"
-                if by_radio
-                else "GROUP BY bucket_ts ORDER BY bucket_ts DESC\n"
-            )
-            + "LIMIT ?",
-            params,
+            query,
+            (
+                bucket_seconds,
+                bucket_seconds,
+                peer_hash,
+                path_hash_size,
+                cutoff,
+                radio_id or None,
+                radio_id or None,
+                limit,
+            ),
         ).fetchall()
 
         def mean(value):
