@@ -81,6 +81,109 @@ class ConfigManager:
 
         return False
 
+    def default_physical_radio(self):
+        """The default radio's hardware object, unwrapped from Fabric/adapters.
+
+        Mesh CLI hardware commands act on this radio only: a multi-radio node can
+        mix boards with different front ends, so one global setting is ill-defined.
+        """
+        radio = getattr(self.daemon, "radio", None)
+        root = getattr(radio, "_radio", radio)
+        fabric = getattr(root, "fabric", None)
+        radios = getattr(fabric, "radios", None)
+        if radios:
+            return radios.get(getattr(fabric, "default_radio_id", None))
+        return root
+
+    def _default_radio_entry(self) -> Optional[dict]:
+        radios_cfg = self.config.get("radios")
+        if not isinstance(radios_cfg, list) or not radios_cfg:
+            return None
+        fabric_cfg = (
+            self.config.get("fabric") if isinstance(self.config.get("fabric"), dict) else {}
+        )
+        default_id = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
+        for entry in radios_cfg:
+            if isinstance(entry, dict) and default_id is not None:
+                if str(entry.get("id") or entry.get("radio_id")) == str(default_id):
+                    return entry
+        return radios_cfg[0] if isinstance(radios_cfg[0], dict) else None
+
+    def default_kiss_section(self) -> dict:
+        """The ``kiss`` mapping the default radio is built from, for writing.
+
+        A ``radios[]`` entry that inherits the top-level section gets its own copy
+        first, so a CLI change to the default radio does not leak into other
+        radios that share that section on the next restart.
+        """
+        top = self.config.get("kiss")
+        if not isinstance(top, dict):
+            top = self.config["kiss"] = {}
+        entry = self._default_radio_entry()
+        if entry is None:
+            return top
+        if not isinstance(entry.get("kiss"), dict):
+            entry["kiss"] = dict(top)
+        return entry["kiss"]
+
+    def _default_radio_board_config(self) -> dict:
+        entry = self._default_radio_entry()
+        if entry is None:
+            return self.config
+        from repeater.config import _merge_radio_entry
+
+        return _merge_radio_entry(self.config, entry)
+
+    def _apply_live_kiss_hardware_config(self) -> bool:
+        """Push changed AGC/FEM settings to the default KISS radio.
+
+        Compares against the wrapper's own record of what it applied, so an
+        unrelated section update does not resend settings (which would also
+        restart the modem's AGC countdown). Returns False when a configured
+        setting could not be applied.
+        """
+        from repeater.config import kiss_hardware_config
+
+        desired = kiss_hardware_config(self._default_radio_board_config())
+        if not desired:
+            return True
+        radio = self.default_physical_radio()
+        if not callable(getattr(radio, "set_agc_reset_interval", None)):
+            # Not a KISS modem (or an openhop-core without the controls): nothing to
+            # apply, as at build time. The legacy repeater key made this common.
+            logger.debug("Default radio has no KISS AGC/FEM controls; skipping %s", desired)
+            return True
+        applied = getattr(radio, "radio_config", None)
+        applied = applied if isinstance(applied, dict) else {}
+        ok = True
+
+        agc = desired.get("agc_reset_interval_seconds")
+        if agc is not None and applied.get("agc_reset_interval_seconds") != agc - agc % 4:
+            if not radio.supports_agc_reset_control():
+                logger.warning("Modem does not support AGC reset interval control")
+                ok = False
+            elif radio.set_agc_reset_interval(agc) is None:
+                logger.warning("Failed to apply AGC reset interval %ss", agc)
+                ok = False
+
+        fem = {}
+        for key, supported in (
+            ("fem_rx_gain", radio.supports_fem_rx_gain),
+            ("fem_tx_gain", radio.supports_fem_tx_gain),
+        ):
+            value = desired.get(key)
+            if value is None or applied.get(key) == value:
+                continue
+            if not supported():
+                logger.warning("Modem does not support %s", key)
+                ok = False
+                continue
+            fem[key[4:]] = value  # rx_gain / tx_gain
+        if fem and radio.set_fem_state(**fem) is None:
+            logger.warning("Failed to apply FEM state %s", fem)
+            ok = False
+        return ok
+
     def _apply_live_radio_config(self) -> bool:
         radio = getattr(self.daemon, "radio", None)
         if radio is None:
@@ -441,6 +544,9 @@ class ConfigManager:
 
             if "kiss" in sections and self._kiss_transport_restart_required():
                 live_update_ok = False
+            elif "kiss" in sections or "repeater" in sections:
+                # "repeater" carries the legacy agc_reset_interval key.
+                live_update_ok = self._apply_live_kiss_hardware_config() and live_update_ok
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok

@@ -280,3 +280,126 @@ def test_non_default_radio_change_requires_restart_and_keeps_runtime_metering():
     assert manager.live_update_daemon(["radios"]) is False
 
     assert budgets.for_radio("link").calculate_airtime(50) == old_airtime
+
+
+class _DummyKissHwRadio:
+    """KissModemWrapper AGC/FEM surface; records commands sent to the modem."""
+
+    def __init__(self, caps=("agc", "rx", "tx"), radio_config=None):
+        self.caps = set(caps)
+        self.radio_config = dict(radio_config or {})
+        self.calls = []
+
+    def supports_agc_reset_control(self):
+        return "agc" in self.caps
+
+    def supports_fem_rx_gain(self):
+        return "rx" in self.caps
+
+    def supports_fem_tx_gain(self):
+        return "tx" in self.caps
+
+    def set_agc_reset_interval(self, seconds):
+        self.calls.append(("agc", seconds))
+        effective = seconds - seconds % 4
+        self.radio_config["agc_reset_interval_seconds"] = effective
+        return effective
+
+    def set_fem_state(self, rx_gain=None, tx_gain=None):
+        self.calls.append(("fem", rx_gain, tx_gain))
+        state = {}
+        for key, value in (("fem_rx_gain", rx_gain), ("fem_tx_gain", tx_gain)):
+            if value is not None:
+                self.radio_config[key] = value
+                state[key] = value
+        return state
+
+
+def _kiss_manager(config, radio):
+    daemon = _DummyDaemon(config, radio)
+    return ConfigManager("/tmp/config.yaml", config, daemon), daemon
+
+
+def test_live_kiss_update_applies_changed_agc_and_fem():
+    config = {
+        "kiss": {"port": "/dev/ttyACM0", "agc_reset_interval_seconds": 4, "fem_rx_gain": True}
+    }
+    radio = _DummyKissHwRadio(radio_config={"agc_reset_interval_seconds": 30})
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["kiss"])
+    assert radio.calls == [("agc", 4), ("fem", True, None)]
+
+
+def test_live_kiss_update_skips_settings_already_running():
+    config = {"kiss": {"port": "/dev/ttyACM0", "agc_reset_interval_seconds": 10}}
+    # The wrapper records the effective (rounded) value, which must count as a match.
+    radio = _DummyKissHwRadio(radio_config={"agc_reset_interval_seconds": 8})
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["repeater"])
+    assert radio.calls == []
+
+
+def test_live_kiss_update_reports_unsupported_settings():
+    config = {"kiss": {"port": "/dev/ttyACM0", "fem_rx_gain": True, "fem_tx_gain": True}}
+    radio = _DummyKissHwRadio(caps=("agc", "rx"))
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["kiss"]) is False
+    assert radio.calls == [("fem", True, None)]
+
+
+def test_live_kiss_update_ignores_legacy_key_on_non_kiss_radio():
+    config = {
+        "repeater": {"agc_reset_interval": 8},
+        "radio": {
+            "frequency": 915000000,
+            "bandwidth": 250000,
+            "spreading_factor": 10,
+            "coding_rate": 6,
+            "tx_power": 20,
+        },
+    }
+    manager, _ = _kiss_manager(config, _DummySX1262Radio())
+    assert manager.live_update_daemon(["repeater"])
+
+
+class _DummyFabric:
+    def __init__(self, radios, default_radio_id):
+        self.radios = radios
+        self.default_radio_id = default_radio_id
+
+
+def test_default_physical_radio_unwraps_fabric_and_adapters():
+    a, b = _DummyKissHwRadio(), _DummyKissHwRadio()
+    fabric_radio = type("FabricRadio", (), {})()
+    fabric_radio.fabric = _DummyFabric({"a": a, "b": b}, "b")
+    adapter = type("Adapter", (), {})()
+    adapter._radio = fabric_radio
+    manager = ConfigManager("/tmp/config.yaml", {}, type("D", (), {"radio": adapter})())
+    assert manager.default_physical_radio() is b
+
+
+def test_default_kiss_section_is_scoped_to_the_default_radios_entry():
+    shared = {"port": "/dev/ttyACM0"}
+    config = {
+        "kiss": shared,
+        "radios": [{"id": "a", "radio_type": "kiss"}, {"id": "b", "radio_type": "kiss"}],
+        "fabric": {"default_radio": "b"},
+    }
+    manager = ConfigManager("/tmp/config.yaml", config, None)
+
+    section = manager.default_kiss_section()
+    section["fem_rx_gain"] = True
+
+    assert config["radios"][1]["kiss"] == {"port": "/dev/ttyACM0", "fem_rx_gain": True}
+    assert shared == {"port": "/dev/ttyACM0"}  # radio "a" still inherits the untouched section
+    assert "kiss" not in config["radios"][0]
+
+
+def test_default_kiss_section_single_radio_uses_top_level():
+    config = {}
+    manager = ConfigManager("/tmp/config.yaml", config, None)
+    manager.default_kiss_section()["agc_reset_interval_seconds"] = 4
+    assert config == {"kiss": {"agc_reset_interval_seconds": 4}}
