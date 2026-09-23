@@ -137,9 +137,10 @@ class ConfigManager:
     def _apply_live_kiss_hardware_config(self) -> bool:
         """Push changed AGC/FEM settings to the default KISS radio.
 
-        Compares against the wrapper's own record of what it applied, so an
+        Compares against what the modem has confirmed on this link, so an
         unrelated section update does not resend settings (which would also
-        restart the modem's AGC countdown). Returns False when a configured
+        restart the modem's AGC countdown) while a setting that failed or was
+        unsupported at startup is still retried. Returns False when a configured
         setting could not be applied.
         """
         from repeater.config import kiss_hardware_config
@@ -153,7 +154,7 @@ class ConfigManager:
             # apply, as at build time. The legacy repeater key made this common.
             logger.debug("Default radio has no KISS AGC/FEM controls; skipping %s", desired)
             return True
-        applied = getattr(radio, "radio_config", None)
+        applied = getattr(radio, "applied_hardware_config", None)
         applied = applied if isinstance(applied, dict) else {}
         ok = True
 
@@ -179,9 +180,11 @@ class ConfigManager:
                 ok = False
                 continue
             fem[key[4:]] = value  # rx_gain / tx_gain
-        if fem and radio.set_fem_state(**fem) is None:
-            logger.warning("Failed to apply FEM state %s", fem)
-            ok = False
+        if fem:
+            state = radio.set_fem_state(**fem)
+            if state is None or any(state.get(k) != v for k, v in fem.items()):
+                logger.warning("Failed to apply FEM state %s (modem reports %s)", fem, state)
+                ok = False
         return ok
 
     def _apply_live_radio_config(self) -> bool:

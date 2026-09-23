@@ -841,3 +841,34 @@ def test_fem_set_rejects_bad_value_and_failed_apply():
     assert cli._cmd_set("radio.fem.rxgain on") == "Error: radio did not apply setting"
     assert cli._cmd_get("radio.fem.rxgain") == "Error: no response from radio"
     mgr.save_to_file.assert_not_called()
+
+
+def test_failed_save_rolls_back_in_memory_config():
+    radio = FakeKissRadio()
+    cli, cfg, mgr = _kiss_cli(radio, save_ok=False)
+
+    assert cli._cmd_set("agc.reset.interval 4") == (
+        "Error: applied to radio but failed to save config"
+    )
+    assert radio.agc == 4  # the modem did change
+    assert "kiss" not in cfg
+    assert cfg["repeater"]["agc_reset_interval"] == 8  # legacy value restored
+
+    assert cli._cmd_set("radio.fem.rxgain on") == (
+        "Error: applied to radio but failed to save config"
+    )
+    assert "kiss" not in cfg
+
+    # A later unrelated save must not carry the unsaved hardware setting.
+    mgr.save_to_file.return_value = True
+    assert cli._cmd_set("int.thresh -110") == "OK"
+    assert "kiss" not in cfg
+
+
+def test_failed_save_keeps_existing_kiss_section_intact():
+    radio = FakeKissRadio()
+    cfg = _base_config()
+    cfg["kiss"] = {"port": "/dev/ttyACM0", "fem_rx_gain": False}
+    cli, cfg, _ = _kiss_cli(radio, cfg=cfg, save_ok=False)
+    cli._cmd_set("radio.fem.rxgain on")
+    assert cfg["kiss"] == {"port": "/dev/ttyACM0", "fem_rx_gain": False}

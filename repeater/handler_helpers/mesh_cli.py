@@ -1,4 +1,5 @@
 import concurrent.futures
+import copy
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -81,6 +82,32 @@ class MeshCLI:
         except Exception as e:
             logger.warning(f"Radio capability check {capability} failed: {e}")
             return None
+
+    def _persist_kiss_setting(self, key: str, value: Any) -> bool:
+        """Save a setting the modem has already applied into the default radio's kiss section.
+
+        On a failed save the in-memory config is restored, so a later unrelated
+        save cannot persist it. The modem keeps running the value until restart.
+        """
+        snapshot = {
+            k: copy.deepcopy(self.config[k]) for k in ("kiss", "radios") if k in self.config
+        }
+        legacy = self.repeater_config.get("agc_reset_interval")
+
+        self.config_manager.default_kiss_section()[key] = value
+        if key == "agc_reset_interval_seconds":
+            self.repeater_config.pop("agc_reset_interval", None)  # legacy location
+        if self._save_config_and_apply():
+            return True
+
+        for k in ("kiss", "radios"):
+            if k in snapshot:
+                self.config[k] = snapshot[k]
+            else:
+                self.config.pop(k, None)
+        if legacy is not None:
+            self.repeater_config["agc_reset_interval"] = legacy
+        return False
 
     def _get_security_config(self) -> Dict[str, Any]:
         """Return the repeater login security section (the one LoginHelper reads)."""
@@ -844,10 +871,8 @@ class MeshCLI:
                 effective = radio.set_agc_reset_interval(interval)
                 if effective is None:
                     return "Error: radio did not apply setting"
-                self.config_manager.default_kiss_section()["agc_reset_interval_seconds"] = effective
-                self.repeater_config.pop("agc_reset_interval", None)  # legacy location
-                if not self._save_config_and_apply():
-                    return "Error: Failed to save config"
+                if not self._persist_kiss_setting("agc_reset_interval_seconds", effective):
+                    return "Error: applied to radio but failed to save config"
                 return f"OK - interval rounded to {effective}"
 
             elif key in self._FEM_KEYS:
@@ -861,9 +886,8 @@ class MeshCLI:
                 setter = radio.set_fem_rx_gain if state_key == "rx_gain" else radio.set_fem_tx_gain
                 if not setter(enabled):
                     return "Error: radio did not apply setting"
-                self.config_manager.default_kiss_section()[f"fem_{state_key}"] = enabled
-                if not self._save_config_and_apply():
-                    return "Error: Failed to save config"
+                if not self._persist_kiss_setting(f"fem_{state_key}", enabled):
+                    return "Error: applied to radio but failed to save config"
                 return "OK"
 
             else:
