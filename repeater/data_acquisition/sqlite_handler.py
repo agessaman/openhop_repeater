@@ -16,6 +16,8 @@ logger = logging.getLogger("SQLiteHandler")
 # Every column the airtime charts read. idx_packets_airtime must hold all of
 # them: on slow storage the difference between an index-only range scan and a
 # heap lookup per row is what keeps a 24 h window inside the client timeout.
+# Widening the chart query without widening this index is how the airtime chart
+# went back to full scans once before.
 AIRTIME_INDEX_COLUMNS = (
     "timestamp",
     "length",
@@ -24,10 +26,16 @@ AIRTIME_INDEX_COLUMNS = (
     "rx_radio_id",
     "tx_radio_id",
     "tx_radio_ids",
+    "airtime_ms",
 )
 
+# The column set idx_packets_airtime held before airtime_ms existed. Frozen so
+# the migration that first widened the index keeps working on a database old
+# enough to run it, where the airtime_ms column has not been added yet.
+AIRTIME_INDEX_COLUMNS_PRE_AIRTIME_MS = AIRTIME_INDEX_COLUMNS[:-1]
+
 AIRTIME_BUCKETS_QUERY = (
-    "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, tx_radio_ids "
+    "SELECT timestamp, length, transmitted, rx_radio_id, tx_radio_id, tx_radio_ids, airtime_ms "
     "FROM packets WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC"
 )
 
@@ -278,6 +286,32 @@ def packet_carriers(transmitted, rx_radio_id, tx_radio_id, tx_radio_ids) -> Tupl
         return [rx_radio_id], []
     rx_ids = [rx_radio_id] if rx_radio_id is not None else []
     return rx_ids, decode_tx_radio_ids(tx_radio_ids) or [tx_radio_id]
+
+
+def carrier_radio_id(rx_radio_id, tx_radio_id):
+    """The radio a row's stored ``airtime_ms`` was measured on.
+
+    Mirrors the rule the engine uses when it builds the record: the radio that
+    heard the packet, or the one that first sent it when this node originated
+    it. On a bridge the other side's egress is a different length of
+    transmission entirely, so the stored figure describes this radio only.
+    """
+    return rx_radio_id if rx_radio_id is not None else tx_radio_id
+
+
+def _stored_airtime_ms(value):
+    """Normalise a record's ``airtime_ms`` for storage, or None to leave it unset.
+
+    The engine reports 0.0 when it could not measure a packet -- no raw length,
+    or no radio to ask. Storing that would read as a real, free transmission and
+    silently pull a bucket down; NULL instead sends the row through the same
+    estimate as one written before the column existed.
+    """
+    try:
+        airtime_ms = float(value)
+    except (TypeError, ValueError):
+        return None
+    return airtime_ms if airtime_ms > 0 else None
 
 
 def _lbt_weighted_percentile(attempt_counts: dict, q: float) -> Optional[float]:
@@ -1570,7 +1604,7 @@ class SQLiteHandler:
                     conn.execute("DROP INDEX IF EXISTS idx_packets_airtime")
                     conn.execute(
                         "CREATE INDEX idx_packets_airtime ON packets("
-                        + ", ".join(AIRTIME_INDEX_COLUMNS)
+                        + ", ".join(AIRTIME_INDEX_COLUMNS_PRE_AIRTIME_MS)
                         + ")"
                     )
                     conn.execute(
@@ -1645,6 +1679,44 @@ class SQLiteHandler:
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_packet_egress_time_radio ON packet_egress("
                         "timestamp, radio_id, success, lbt_attempts, lbt_channel_busy)"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 21: record each packet's time on air as it is stored.
+                # The charts used to recompute it from whatever the radio is tuned
+                # to now, so retuning restated every hour already drawn -- an
+                # SF9-to-SF11 change quadruples yesterday's utilisation. Rows
+                # written before this stay NULL and are still estimated from the
+                # current settings, which is the only figure their data supports.
+                migration_name = "add_packet_airtime_ms"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(packets)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "airtime_ms" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN airtime_ms REAL")
+                        logger.info("Added airtime_ms column to packets table")
+
+                    # The chart query now selects airtime_ms, so the covering
+                    # index has to hold it too. Left out, every row in the window
+                    # costs a heap lookup, which is what made a 24 h window
+                    # outlast the dashboard's timeout on SD-card storage.
+                    logger.info(
+                        "Rebuilding idx_packets_airtime to cover airtime_ms; "
+                        "this reads the packets table once"
+                    )
+                    conn.execute("DROP INDEX IF EXISTS idx_packets_airtime")
+                    conn.execute(
+                        "CREATE INDEX idx_packets_airtime ON packets("
+                        + ", ".join(AIRTIME_INDEX_COLUMNS)
+                        + ")"
                     )
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
@@ -1887,8 +1959,9 @@ class SQLiteHandler:
                         header, transport_codes, payload, payload_length,
                         tx_delay_ms, rx_radio_id, tx_radio_id, tx_radio_ids,
                         packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy,
+                        airtime_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         record.get("timestamp", time.time()),
@@ -1929,6 +2002,7 @@ class SQLiteHandler:
                             else None
                         ),
                         int(bool(record.get("lbt_channel_busy", False))),
+                        _stored_airtime_ms(record.get("airtime_ms")),
                     ),
                 )
                 self._invalidate_hot_caches()
@@ -2995,6 +3069,13 @@ class SQLiteHandler:
         whose radio cannot be identified is counted as unattributed rather than
         guessed onto the default radio.
 
+        Airtime is read from the row's own ``airtime_ms`` wherever it is stored,
+        so history keeps the settings each packet was actually carried on. Only
+        a row without one is estimated from ``radio_profiles``, which is the
+        live configuration: rows written before the column existed, and the far
+        side of a bridged relay, whose egress is a different transmission from
+        the ingress the stored figure measured.
+
         The legacy top-level ``buckets``/``rx_total``/``tx_total`` fields remain,
         carrying the sum across radios for UI builds that predate ``radios``.
         """
@@ -3071,10 +3152,20 @@ class SQLiteHandler:
             unattributed_rx = 0
             unattributed_tx = 0
 
-            def _record(kind: str, radio_id, length, bucket_ts: int, total_bucket: dict) -> None:
+            def _record(
+                kind: str,
+                radio_id,
+                length,
+                bucket_ts: int,
+                total_bucket: dict,
+                stored_ms: Optional[float] = None,
+            ) -> None:
                 nonlocal rx_total, tx_total, unattributed_rx, unattributed_tx
                 resolved = resolver.resolve(radio_id)
-                ms = _airtime_ms(resolved, length) if resolved else 0.0
+                if stored_ms is not None:
+                    ms = stored_ms
+                else:
+                    ms = _airtime_ms(resolved, length) if resolved else 0.0
                 if resolved:
                     entry = series[resolved]
                     bucket = entry["buckets"].get(bucket_ts)
@@ -3104,10 +3195,28 @@ class SQLiteHandler:
                 rx_ids, tx_ids = packet_carriers(
                     row["transmitted"], row["rx_radio_id"], row["tx_radio_id"], row["tx_radio_ids"]
                 )
+
+                # The measurement this row carries, and the radio it was taken
+                # on. Anything charged to a different radio -- the far side of a
+                # bridged relay -- is not described by it and is estimated from
+                # that radio's current settings, as every row was before.
+                stored_ms = _stored_airtime_ms(row["airtime_ms"])
+                carrier = (
+                    resolver.resolve(carrier_radio_id(row["rx_radio_id"], row["tx_radio_id"]))
+                    if stored_ms is not None
+                    else None
+                )
+                # A row nobody can attribute keeps counting as zero, as it did
+                # before there was a measurement to offer it.
+                if carrier is None:
+                    stored_ms = None
+
                 for radio_id in rx_ids:
-                    _record("rx", radio_id, length, bucket_ts, total_bucket)
+                    stored = stored_ms if resolver.resolve(radio_id) == carrier else None
+                    _record("rx", radio_id, length, bucket_ts, total_bucket, stored)
                 for radio_id in tx_ids:
-                    _record("tx", radio_id, length, bucket_ts, total_bucket)
+                    stored = stored_ms if resolver.resolve(radio_id) == carrier else None
+                    _record("tx", radio_id, length, bucket_ts, total_bucket, stored)
 
             radios = []
             for radio_id in order:

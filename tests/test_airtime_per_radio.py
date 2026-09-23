@@ -356,3 +356,106 @@ def test_unsupported_radio_type_has_no_profile():
     """get_radio_for_board would reject it, so no radio was built from it."""
     assert build_radio_profiles({"radio_type": "sx1280", "radio": {"spreading_factor": 8}}) == []
     assert build_radio_profiles({"radio_type": "none"}) == []
+
+
+# --- Stored airtime: history keeps the settings each packet was carried on ----
+
+
+def test_retuning_the_radio_does_not_restate_stored_history(handler):
+    """The reported bug: history rescaled itself to whatever the radio is now.
+
+    A packet stored with its measured time on air keeps that figure when the
+    node is retuned, instead of yesterday's traffic quadrupling because the
+    operator moved from SF8 to SF11.
+    """
+    _store(handler, rx_radio_id="local", airtime_ms=123.5)
+
+    as_stored = _buckets(handler, [LOCAL])
+    retuned = _buckets(handler, [dict(LOCAL, spreading_factor=11)])
+
+    assert _radio(as_stored, "local")["buckets"][0]["rx_ms"] == pytest.approx(123.5)
+    assert _radio(retuned, "local")["buckets"][0]["rx_ms"] == pytest.approx(123.5)
+
+
+def test_rows_without_a_stored_figure_are_still_estimated(handler):
+    """Databases written before the column keep the only answer their data supports."""
+    _store(handler, rx_radio_id="local")
+
+    result = _buckets(handler, [LOCAL])
+
+    assert _radio(result, "local")["buckets"][0]["rx_ms"] == pytest.approx(_expected_ms(LOCAL, 64))
+
+
+def test_an_unmeasurable_packet_is_estimated_rather_than_counted_free(handler):
+    """The engine reports 0.0 when it could not measure; that is not a free packet."""
+    _store(handler, rx_radio_id="local", airtime_ms=0.0)
+
+    result = _buckets(handler, [LOCAL])
+
+    assert _radio(result, "local")["buckets"][0]["rx_ms"] == pytest.approx(_expected_ms(LOCAL, 64))
+
+
+def test_a_bridged_relay_charges_each_side_its_own_transmission(handler):
+    """The stored figure measures the ingress only; the far egress is estimated.
+
+    One packet heard on ``local`` and relayed out of ``link`` is two different
+    lengths of transmission. Charging the far side the ingress measurement would
+    understate it by the ratio of their modulations.
+    """
+    _store(
+        handler,
+        transmitted=True,
+        rx_radio_id="local",
+        tx_radio_id="link",
+        tx_radio_ids=["link"],
+        airtime_ms=123.5,
+    )
+
+    result = _buckets(handler, BRIDGE)
+
+    assert _radio(result, "local")["buckets"][0]["rx_ms"] == pytest.approx(123.5)
+    assert _radio(result, "link")["buckets"][0]["tx_ms"] == pytest.approx(_expected_ms(LINK, 64))
+
+
+def test_a_node_originated_packet_is_measured_on_the_radio_that_sent_it(handler):
+    """With no ingress, the stored figure belongs to the primary egress."""
+    _store(
+        handler,
+        transmitted=True,
+        rx_radio_id=None,
+        tx_radio_id="link",
+        tx_radio_ids=["link"],
+        airtime_ms=456.25,
+    )
+
+    result = _buckets(handler, BRIDGE)
+
+    assert _radio(result, "link")["buckets"][0]["tx_ms"] == pytest.approx(456.25)
+    assert _radio(result, "local")["buckets"] == []
+
+
+def test_a_single_radio_node_measures_both_directions(handler):
+    """One radio carries the reception and the relay, so one figure covers both."""
+    _store(
+        handler,
+        transmitted=True,
+        rx_radio_id=None,
+        tx_radio_id=None,
+        airtime_ms=200.0,
+    )
+
+    result = _buckets(handler, [LOCAL])
+    bucket = _radio(result, "local")["buckets"][0]
+
+    assert bucket["tx_ms"] == pytest.approx(200.0)
+    assert result["buckets"][0]["tx_ms"] == pytest.approx(200.0)
+
+
+def test_an_unattributable_packet_still_counts_as_zero(handler):
+    """A stored figure does not rescue a row no configured radio claims."""
+    _store(handler, rx_radio_id="retired", airtime_ms=999.0)
+
+    result = _buckets(handler, BRIDGE)
+
+    assert result["unattributed_rx_count"] == 1
+    assert result["buckets"][0]["rx_ms"] == 0.0

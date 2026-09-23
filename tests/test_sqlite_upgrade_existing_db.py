@@ -273,3 +273,41 @@ def test_fresh_database_airtime_index_covers_radio_ids():
         assert _index_columns(path, "idx_packets_airtime") == AIRTIME_INDEX_COLUMNS
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_upgrade_adds_airtime_ms_and_keeps_old_rows_chartable(legacy_db):
+    """The column arrives on an existing database, and its history survives.
+
+    Rows written before it stay NULL rather than being backfilled: nothing
+    recorded the settings they were carried on, so any figure put there would be
+    a guess wearing a measurement's clothes.
+    """
+    d, path = legacy_db
+
+    handler = SQLiteHandler(Path(d))
+
+    con = sqlite3.connect(path)
+    try:
+        columns = [row[1] for row in con.execute("PRAGMA table_info(packets)")]
+        assert "airtime_ms" in columns
+        assert con.execute("SELECT airtime_ms FROM packets").fetchall() == [(None,)]
+    finally:
+        con.close()
+
+    # A row written after the upgrade, alongside the one that predates it. Added
+    # directly because this fixture's schema is older than several other packets
+    # columns store_packet writes; the column under test is the point here.
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO packets (timestamp, type, length, airtime_ms) VALUES (?, ?, ?, ?)",
+            (2.0, 1, 64, 88.5),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    result = handler.get_airtime_buckets(start_timestamp=0.0, end_timestamp=10.0, bucket_seconds=60)
+    # Both charted: the measured row at its measurement, the older one estimated.
+    assert result["rx_total"] == 2
+    assert result["buckets"][0]["rx_ms"] > 88.5
