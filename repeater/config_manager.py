@@ -134,6 +134,116 @@ class ConfigManager:
 
         return _merge_radio_entry(self.config, entry)
 
+    # KISS front-end config key -> KissModemWrapper capability check
+    KISS_FRONTEND_CONTROLS = {
+        "agc_reset_interval_seconds": "supports_agc_reset_control",
+        "fem_rx_gain": "supports_fem_rx_gain",
+        "fem_tx_gain": "supports_fem_tx_gain",
+    }
+
+    def _kiss_frontend_radio(self):
+        radio = self.default_physical_radio()
+        return radio if callable(getattr(radio, "set_agc_reset_interval", None)) else None
+
+    def persist_default_kiss_settings(self, updates: Dict[str, Any]) -> bool:
+        """Save settings the modem has already applied into the default radio's kiss section.
+
+        On a failed save the in-memory config is restored, so a later unrelated
+        save cannot persist them. The modem keeps running the values until restart.
+        """
+        with _CONFIG_WRITE_LOCK:
+            snapshot = {
+                k: copy.deepcopy(self.config[k]) for k in ("kiss", "radios") if k in self.config
+            }
+            repeater_cfg = self.config.get("repeater")
+            repeater_cfg = repeater_cfg if isinstance(repeater_cfg, dict) else {}
+            legacy = repeater_cfg.get("agc_reset_interval")
+
+            self.default_kiss_section().update(updates)
+            if "agc_reset_interval_seconds" in updates:
+                repeater_cfg.pop("agc_reset_interval", None)  # legacy location
+            if self.save_to_file():
+                return True
+
+            for k in ("kiss", "radios"):
+                if k in snapshot:
+                    self.config[k] = snapshot[k]
+                else:
+                    self.config.pop(k, None)
+            if legacy is not None:
+                repeater_cfg["agc_reset_interval"] = legacy
+            return False
+
+    def kiss_frontend_status(self) -> Dict[str, Any]:
+        """Front-end controls of the default radio, read from the modem.
+
+        ``configured`` is what the config asks for (absent = board default);
+        ``running`` is what the modem reports now.
+        """
+        from repeater.config import kiss_hardware_config
+
+        radio = self._kiss_frontend_radio()
+        supports = {key: False for key in self.KISS_FRONTEND_CONTROLS}
+        running: Dict[str, Any] = {}
+        if radio is not None:
+            for key, check in self.KISS_FRONTEND_CONTROLS.items():
+                supports[key] = bool(getattr(radio, check)())
+            if supports["agc_reset_interval_seconds"]:
+                interval = radio.get_agc_reset_interval()
+                if interval is not None:
+                    running["agc_reset_interval_seconds"] = interval
+            if supports["fem_rx_gain"] or supports["fem_tx_gain"]:
+                state = radio.get_fem_state() or {}
+                for key in ("rx_gain", "tx_gain"):
+                    if state.get(key) is not None:
+                        running[f"fem_{key}"] = state[key]
+        return {
+            "available": radio is not None,
+            "supports": supports,
+            "running": running,
+            "configured": kiss_hardware_config(self._default_radio_board_config()),
+        }
+
+    def apply_kiss_frontend(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply front-end settings to the default radio, then persist what it confirmed.
+
+        ``updates`` must already be validated (AGC 0-1020 int, FEM bools). Returns
+        ``{"applied": {...}, "errors": {key: reason}}``; a failed save is reported
+        under the ``"save"`` error key.
+        """
+        radio = self._kiss_frontend_radio()
+        applied: Dict[str, Any] = {}
+        errors: Dict[str, str] = {}
+        for key in updates:
+            check = self.KISS_FRONTEND_CONTROLS[key]
+            if radio is None or not getattr(radio, check)():
+                errors[key] = "unsupported"
+
+        agc = updates.get("agc_reset_interval_seconds")
+        if agc is not None and "agc_reset_interval_seconds" not in errors:
+            effective = radio.set_agc_reset_interval(agc)
+            if effective is None:
+                errors["agc_reset_interval_seconds"] = "radio did not apply setting"
+            else:
+                applied["agc_reset_interval_seconds"] = effective
+
+        fem = {
+            key[4:]: updates[key]
+            for key in ("fem_rx_gain", "fem_tx_gain")
+            if key in updates and key not in errors
+        }
+        if fem:
+            state = radio.set_fem_state(**fem) or {}
+            for key, value in fem.items():
+                if state.get(key) == value:
+                    applied[f"fem_{key}"] = value
+                else:
+                    errors[f"fem_{key}"] = "radio did not apply setting"
+
+        if applied and not self.persist_default_kiss_settings(applied):
+            errors["save"] = "applied to radio but failed to save config"
+        return {"applied": applied, "errors": errors}
+
     def _apply_live_kiss_hardware_config(self) -> bool:
         """Push changed AGC/FEM settings to the default KISS radio.
 

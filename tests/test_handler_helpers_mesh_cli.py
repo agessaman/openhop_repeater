@@ -759,10 +759,12 @@ def test_cli_set_commands_persist_with_real_config_manager(tmp_path):
 
 
 def _kiss_cli(radio, cfg=None, save_ok=True):
+    from repeater.config_manager import ConfigManager
+
     cfg = cfg if cfg is not None else _base_config()
-    mgr = _cfg_mgr(save_ok=save_ok)
-    mgr.default_physical_radio = lambda: radio
-    mgr.default_kiss_section = lambda: cfg.setdefault("kiss", {})
+    mgr = ConfigManager("/tmp/cfg.yaml", cfg, SimpleNamespace(radio=radio))
+    mgr.save_to_file = MagicMock(return_value=save_ok)
+    mgr.live_update_daemon = MagicMock()
     return MeshCLI("/tmp/cfg.yaml", cfg, mgr), cfg, mgr
 
 
