@@ -47,10 +47,11 @@ def _base_config():
 class FakeKissRadio:
     """Just the KissModemWrapper AGC/FEM surface the CLI uses."""
 
-    def __init__(self, caps=("agc", "rx", "tx"), responsive=True):
+    def __init__(self, caps=("agc", "rx", "tx", "boost"), responsive=True):
         self.caps = set(caps)
         self.responsive = responsive
-        self.agc = 30
+        self.boosted = True
+        self.agc = 32
         self.fem = {"rx_gain": False, "tx_gain": False}
         self.radio_config = {}
 
@@ -62,6 +63,18 @@ class FakeKissRadio:
 
     def supports_fem_tx_gain(self):
         return "tx" in self.caps
+
+    def supports_rx_boosted_gain(self):
+        return "boost" in self.caps
+
+    def get_rx_boosted_gain(self):
+        return self.boosted if self.responsive else None
+
+    def set_rx_boosted_gain(self, enabled):
+        if not self.responsive:
+            return None
+        self.boosted = enabled
+        return self.boosted
 
     def get_agc_reset_interval(self):
         return self.agc if self.responsive else None
@@ -874,3 +887,28 @@ def test_failed_save_keeps_existing_kiss_section_intact():
     cli, cfg, _ = _kiss_cli(radio, cfg=cfg, save_ok=False)
     cli._cmd_set("radio.fem.rxgain on")
     assert cfg["kiss"] == {"port": "/dev/ttyACM0", "fem_rx_gain": False}
+
+
+def test_rxgain_get_and_set():
+    radio = FakeKissRadio()
+    cli, cfg, mgr = _kiss_cli(radio)
+    assert cli._cmd_get("radio.rxgain") == "> on"
+    assert cli._cmd_set("radio.rxgain off") == "OK"
+    assert radio.boosted is False
+    assert cfg["kiss"]["rx_boosted_gain"] is False
+    assert cli._cmd_get("radio.rxgain") == "> off"
+    # Separate from the external LNA
+    assert radio.fem["rx_gain"] is False
+
+
+def test_rxgain_unsupported_and_failures():
+    cli, cfg, mgr = _kiss_cli(FakeKissRadio(caps=("agc", "rx")))
+    assert cli._cmd_get("radio.rxgain") == "Error: unsupported"
+    assert cli._cmd_set("radio.rxgain on") == "Error: unsupported"
+
+    radio = FakeKissRadio(responsive=False)
+    cli, cfg, mgr = _kiss_cli(radio)
+    assert cli._cmd_set("radio.rxgain maybe") == "Error: must be on or off"
+    assert cli._cmd_set("radio.rxgain off") == "Error: radio did not apply setting"
+    assert cli._cmd_get("radio.rxgain") == "Error: no response from radio"
+    mgr.save_to_file.assert_not_called()

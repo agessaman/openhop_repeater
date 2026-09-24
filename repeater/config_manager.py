@@ -139,7 +139,14 @@ class ConfigManager:
         "agc_reset_interval_seconds": "supports_agc_reset_control",
         "fem_rx_gain": "supports_fem_rx_gain",
         "fem_tx_gain": "supports_fem_tx_gain",
+        "rx_boosted_gain": "supports_rx_boosted_gain",
     }
+
+    @staticmethod
+    def _radio_supports(radio, check: str) -> bool:
+        # An openhop-core that predates a control has no method for it.
+        method = getattr(radio, check, None)
+        return bool(method()) if callable(method) else False
 
     def _kiss_frontend_radio(self):
         radio = self.default_physical_radio()
@@ -187,7 +194,7 @@ class ConfigManager:
         running: Dict[str, Any] = {}
         if radio is not None:
             for key, check in self.KISS_FRONTEND_CONTROLS.items():
-                supports[key] = bool(getattr(radio, check)())
+                supports[key] = self._radio_supports(radio, check)
             if supports["agc_reset_interval_seconds"]:
                 interval = radio.get_agc_reset_interval()
                 if interval is not None:
@@ -197,6 +204,10 @@ class ConfigManager:
                 for key in ("rx_gain", "tx_gain"):
                     if state.get(key) is not None:
                         running[f"fem_{key}"] = state[key]
+            if supports["rx_boosted_gain"]:
+                boosted = radio.get_rx_boosted_gain()
+                if boosted is not None:
+                    running["rx_boosted_gain"] = boosted
         return {
             "available": radio is not None,
             "supports": supports,
@@ -207,7 +218,7 @@ class ConfigManager:
     def apply_kiss_frontend(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         """Apply front-end settings to the default radio, then persist what it confirmed.
 
-        ``updates`` must already be validated (AGC 0-1020 int, FEM bools). Returns
+        ``updates`` must already be validated (AGC 0-1020 int, gains bools). Returns
         ``{"applied": {...}, "errors": {key: reason}}``; a failed save is reported
         under the ``"save"`` error key.
         """
@@ -216,7 +227,7 @@ class ConfigManager:
         errors: Dict[str, str] = {}
         for key in updates:
             check = self.KISS_FRONTEND_CONTROLS[key]
-            if radio is None or not getattr(radio, check)():
+            if radio is None or not self._radio_supports(radio, check):
                 errors[key] = "unsupported"
 
         agc = updates.get("agc_reset_interval_seconds")
@@ -240,12 +251,20 @@ class ConfigManager:
                 else:
                     errors[f"fem_{key}"] = "radio did not apply setting"
 
+        boosted = updates.get("rx_boosted_gain")
+        if boosted is not None and "rx_boosted_gain" not in errors:
+            if radio.set_rx_boosted_gain(boosted) == boosted:
+                applied["rx_boosted_gain"] = boosted
+            else:
+                # Refused while a packet was on air, or the radio read back otherwise.
+                errors["rx_boosted_gain"] = "radio did not apply setting"
+
         if applied and not self.persist_default_kiss_settings(applied):
             errors["save"] = "applied to radio but failed to save config"
         return {"applied": applied, "errors": errors}
 
     def _apply_live_kiss_hardware_config(self) -> bool:
-        """Push changed AGC/FEM settings to the default KISS radio.
+        """Push changed AGC/FEM/boosted-gain settings to the default KISS radio.
 
         Compares against what the modem has confirmed on this link, so an
         unrelated section update does not resend settings (which would also
@@ -278,14 +297,11 @@ class ConfigManager:
                 ok = False
 
         fem = {}
-        for key, supported in (
-            ("fem_rx_gain", radio.supports_fem_rx_gain),
-            ("fem_tx_gain", radio.supports_fem_tx_gain),
-        ):
+        for key in ("fem_rx_gain", "fem_tx_gain"):
             value = desired.get(key)
             if value is None or applied.get(key) == value:
                 continue
-            if not supported():
+            if not self._radio_supports(radio, self.KISS_FRONTEND_CONTROLS[key]):
                 logger.warning("Modem does not support %s", key)
                 ok = False
                 continue
@@ -294,6 +310,15 @@ class ConfigManager:
             state = radio.set_fem_state(**fem)
             if state is None or any(state.get(k) != v for k, v in fem.items()):
                 logger.warning("Failed to apply FEM state %s (modem reports %s)", fem, state)
+                ok = False
+
+        boosted = desired.get("rx_boosted_gain")
+        if boosted is not None and applied.get("rx_boosted_gain") != boosted:
+            if not self._radio_supports(radio, "supports_rx_boosted_gain"):
+                logger.warning("Modem does not support RX boosted gain control")
+                ok = False
+            elif radio.set_rx_boosted_gain(boosted) != boosted:
+                logger.warning("Failed to apply RX boosted gain %s", boosted)
                 ok = False
         return ok
 

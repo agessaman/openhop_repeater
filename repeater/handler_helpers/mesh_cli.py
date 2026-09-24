@@ -318,6 +318,7 @@ class MeshCLI:
             "  get agc.reset.interval  AGC reset interval (KISS modem)",
             "  get radio.fem.rxgain  External FEM RX gain (KISS modem)",
             "  get radio.fem.txgain  External FEM TX gain (KISS modem)",
+            "  get radio.rxgain    Radio chip boosted RX gain (KISS modem)",
             "",
             "Set:  (use 'help set' for details)",
             "  set <param> <value>",
@@ -365,7 +366,8 @@ class MeshCLI:
                 "  set int.thresh <dbm>   Interference threshold\n"
                 "  set agc.reset.interval <n>  AGC reset secs (x4, 0=off; KISS modem)\n"
                 "  set radio.fem.rxgain on|off  External FEM RX gain (KISS modem)\n"
-                "  set radio.fem.txgain on|off  External FEM TX gain (KISS modem)"
+                "  set radio.fem.txgain on|off  External FEM TX gain (KISS modem)\n"
+                "  set radio.rxgain on|off  Radio chip boosted RX gain (KISS modem)"
             ),
             "get": "Get commands \u2014 type 'help' to see all 'get' parameters.",
             "reboot": "Restart the repeater service via systemd.",
@@ -643,6 +645,15 @@ class MeshCLI:
                 return "Error: unsupported"
             return f"> {'on' if state[state_key] else 'off'}"
 
+        elif param == "radio.rxgain":
+            radio = self._kiss_radio("supports_rx_boosted_gain")
+            if radio is None:
+                return "Error: unsupported"
+            boosted = radio.get_rx_boosted_gain()
+            if boosted is None:
+                return "Error: no response from radio"
+            return f"> {'on' if boosted else 'off'}"
+
         else:
             return f"??: {param}"
 
@@ -863,6 +874,22 @@ class MeshCLI:
                     return "Error: radio did not apply setting"
                 if not self.config_manager.persist_default_kiss_settings(
                     {f"fem_{state_key}": enabled}
+                ):
+                    return "Error: applied to radio but failed to save config"
+                return "OK"
+
+            elif key == "radio.rxgain":
+                # The radio chip's boosted RX gain; radio.fem.rxgain is the external LNA.
+                if value not in ("on", "off"):
+                    return "Error: must be on or off"
+                radio = self._kiss_radio("supports_rx_boosted_gain")
+                if radio is None:
+                    return "Error: unsupported"
+                enabled = value == "on"
+                if radio.set_rx_boosted_gain(enabled) != enabled:
+                    return "Error: radio did not apply setting"
+                if not self.config_manager.persist_default_kiss_settings(
+                    {"rx_boosted_gain": enabled}
                 ):
                     return "Error: applied to radio but failed to save config"
                 return "OK"

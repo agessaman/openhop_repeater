@@ -306,6 +306,14 @@ class _DummyKissHwRadio:
         self.applied_hardware_config["agc_reset_interval_seconds"] = effective
         return effective
 
+    def supports_rx_boosted_gain(self):
+        return "boost" in self.caps
+
+    def set_rx_boosted_gain(self, enabled):
+        self.calls.append(("boost", enabled))
+        self.applied_hardware_config["rx_boosted_gain"] = enabled
+        return enabled
+
     def set_fem_state(self, rx_gain=None, tx_gain=None):
         self.calls.append(("fem", rx_gain, tx_gain))
         state = {}
@@ -424,4 +432,20 @@ def test_live_kiss_update_fails_when_modem_reports_other_fem_state():
     config = {"kiss": {"port": "/dev/ttyACM0", "fem_tx_gain": True}}
     radio = _DummyKissHwRadio(fem_sticks=False)
     manager, _ = _kiss_manager(config, radio)
+    assert manager.live_update_daemon(["kiss"]) is False
+
+
+def test_live_kiss_update_applies_rx_boosted_gain_once():
+    config = {"kiss": {"port": "/dev/ttyACM0", "rx_boosted_gain": False}}
+    radio = _DummyKissHwRadio(caps=("agc", "boost"))
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["kiss"])
+    assert manager.live_update_daemon(["kiss"])
+    assert radio.calls == [("boost", False)]
+
+
+def test_live_kiss_update_rx_boosted_gain_unsupported():
+    config = {"kiss": {"port": "/dev/ttyACM0", "rx_boosted_gain": True}}
+    manager, _ = _kiss_manager(config, _DummyKissHwRadio(caps=("agc",)))
     assert manager.live_update_daemon(["kiss"]) is False

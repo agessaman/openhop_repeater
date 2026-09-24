@@ -13,11 +13,12 @@ from repeater.web.api_endpoints import APIEndpoints
 class FakeKissRadio:
     """The KissModemWrapper AGC/FEM surface."""
 
-    def __init__(self, caps=("agc", "rx", "tx"), responsive=True, fem_sticks=True):
+    def __init__(self, caps=("agc", "rx", "tx", "boost"), responsive=True, fem_sticks=True):
         self.caps = set(caps)
         self.responsive = responsive
         self.fem_sticks = fem_sticks
-        self.agc = 30
+        self.boosted = True
+        self.agc = 32
         self.fem = {"rx_gain": False, "tx_gain": False}
         self.applied_hardware_config = {}
 
@@ -29,6 +30,19 @@ class FakeKissRadio:
 
     def supports_fem_tx_gain(self):
         return "tx" in self.caps
+
+    def supports_rx_boosted_gain(self):
+        return "boost" in self.caps
+
+    def get_rx_boosted_gain(self):
+        return self.boosted if self.responsive else None
+
+    def set_rx_boosted_gain(self, enabled):
+        if not self.responsive:
+            return None
+        if self.fem_sticks:
+            self.boosted = enabled
+        return self.boosted
 
     def get_agc_reset_interval(self):
         return self.agc if self.responsive else None
@@ -67,7 +81,7 @@ def _manager(radio, config=None, save_ok=True):
 
 
 def test_status_reads_modem_and_config():
-    radio = FakeKissRadio(caps=("agc", "rx"))
+    radio = FakeKissRadio(caps=("agc", "rx", "boost"))
     radio.agc, radio.fem["rx_gain"] = 8, True
     mgr, _ = _manager(radio, {"kiss": {"port": "/dev/x", "fem_rx_gain": True}})
 
@@ -77,8 +91,13 @@ def test_status_reads_modem_and_config():
             "agc_reset_interval_seconds": True,
             "fem_rx_gain": True,
             "fem_tx_gain": False,
+            "rx_boosted_gain": True,
         },
-        "running": {"agc_reset_interval_seconds": 8, "fem_rx_gain": True},
+        "running": {
+            "agc_reset_interval_seconds": 8,
+            "fem_rx_gain": True,
+            "rx_boosted_gain": True,
+        },
         "configured": {"fem_rx_gain": True},
     }
 
@@ -160,7 +179,7 @@ def test_endpoint_get(request_ctx):
     api = _api(FakeKissRadio())
     result = api.radio_frontend()
     assert result["success"] is True
-    assert result["data"]["running"]["agc_reset_interval_seconds"] == 30
+    assert result["data"]["running"]["agc_reset_interval_seconds"] == 32
 
 
 def test_endpoint_post_applies_without_restart(request_ctx):
@@ -199,6 +218,7 @@ def test_endpoint_post_partial_failure_still_returns_status(request_ctx):
         ({"agc_reset_interval_seconds": "4"}, "0-1020"),
         ({"agc_reset_interval_seconds": True}, "0-1020"),
         ({"fem_rx_gain": "on"}, "true or false"),
+        ({"rx_boosted_gain": 1}, "true or false"),
         ({}, "No valid settings"),
         ({"port": "/dev/evil"}, "No valid settings"),
     ],
@@ -213,5 +233,38 @@ def test_endpoint_post_validation(request_ctx, body, message):
 
     assert result["success"] is False
     assert message in result["error"]
-    assert radio.agc == 30
+    assert radio.agc == 32
     api.config_manager.save_to_file.assert_not_called()
+
+
+def test_apply_rx_boosted_gain():
+    radio = FakeKissRadio()
+    mgr, config = _manager(radio)
+    assert mgr.apply_kiss_frontend({"rx_boosted_gain": False}) == {
+        "applied": {"rx_boosted_gain": False},
+        "errors": {},
+    }
+    assert radio.boosted is False
+    assert config["kiss"]["rx_boosted_gain"] is False
+
+
+def test_apply_rx_boosted_gain_refused_is_reported():
+    mgr, config = _manager(FakeKissRadio(fem_sticks=False))  # radio keeps its state
+    result = mgr.apply_kiss_frontend({"rx_boosted_gain": False})
+    assert result["errors"] == {"rx_boosted_gain": "radio did not apply setting"}
+    assert "rx_boosted_gain" not in config["kiss"]
+
+
+def test_status_with_core_that_predates_boosted_gain():
+    """An older openhop-core has no rx-boosted methods; report it as unsupported."""
+
+    class OldCoreRadio(FakeKissRadio):
+        supports_rx_boosted_gain = None
+
+    mgr, _ = _manager(OldCoreRadio())
+    status = mgr.kiss_frontend_status()
+    assert status["supports"]["rx_boosted_gain"] is False
+    assert "rx_boosted_gain" not in status["running"]
+    assert mgr.apply_kiss_frontend({"rx_boosted_gain": True})["errors"] == {
+        "rx_boosted_gain": "unsupported"
+    }

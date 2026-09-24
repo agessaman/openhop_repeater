@@ -483,7 +483,7 @@ def kiss_hardware_config(board_config: dict) -> Dict[str, Any]:
             # Front-end tuning must never stop the radio from being built.
             logger.warning("Ignoring invalid AGC reset interval %r", agc)
 
-    for key in ("fem_rx_gain", "fem_tx_gain"):
+    for key in ("fem_rx_gain", "fem_tx_gain", "rx_boosted_gain"):
         if kiss_cfg.get(key) is not None:
             options[key] = bool(kiss_cfg[key])
     return options

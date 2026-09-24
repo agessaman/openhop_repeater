@@ -821,7 +821,8 @@ paths:
       tags: [System]
       summary: Get KISS modem RF front-end controls
       description: >
-        AGC reset interval and external FEM gain of the default radio, read from the
+        AGC reset interval, external FEM gain and radio chip boosted RX gain of the
+        default radio, read from the
         modem. Only KISS modems running MeshCore KISS firmware v2 or later report
         support; the controls a board supports come from the board itself.
       security:
@@ -5621,6 +5622,11 @@ components:
         fem_tx_gain:
           type: boolean
           description: External FEM TX (PA) high gain
+        rx_boosted_gain:
+          type: boolean
+          description: >
+            The radio chip's own boosted RX gain (MeshCore radio.rxgain), separate
+            from the external FEM RX gain
 
     RadioFrontendStatus:
       type: object
@@ -5631,13 +5637,15 @@ components:
           description: Default radio is a KISS modem with front-end controls
         supports:
           type: object
-          required: [agc_reset_interval_seconds, fem_rx_gain, fem_tx_gain]
+          required: [agc_reset_interval_seconds, fem_rx_gain, fem_tx_gain, rx_boosted_gain]
           properties:
             agc_reset_interval_seconds:
               type: boolean
             fem_rx_gain:
               type: boolean
             fem_tx_gain:
+              type: boolean
+            rx_boosted_gain:
               type: boolean
         running:
           allOf:

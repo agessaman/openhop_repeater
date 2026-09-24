@@ -289,6 +289,7 @@ def test_get_radio_for_board_kiss_omits_unset_tuning(monkeypatch):
         "agc_reset_interval_seconds",
         "fem_rx_gain",
         "fem_tx_gain",
+        "rx_boosted_gain",
     ):
         assert key not in rc
 
@@ -303,6 +304,7 @@ def test_get_radio_for_board_kiss_forwards_agc_and_fem(monkeypatch):
             "agc_reset_interval_seconds": 4,
             "fem_rx_gain": True,
             "fem_tx_gain": False,
+            "rx_boosted_gain": False,
         },
         "repeater": {"agc_reset_interval": 60},  # legacy key loses to canonical
         "radio": _modem_radio_cfg(),
@@ -314,6 +316,7 @@ def test_get_radio_for_board_kiss_forwards_agc_and_fem(monkeypatch):
     assert rc["agc_reset_interval_seconds"] == 4
     assert rc["fem_rx_gain"] is True
     assert rc["fem_tx_gain"] is False
+    assert rc["rx_boosted_gain"] is False
 
 
 def test_kiss_hardware_config_legacy_agc_fallback_and_bounds():

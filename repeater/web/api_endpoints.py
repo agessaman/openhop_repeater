@@ -2123,11 +2123,14 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in(force=False)
     def radio_frontend(self):
-        """KISS modem RF front-end controls (AGC reset interval, FEM gain) of the default radio.
+        """KISS modem RF front-end controls of the default radio.
+
+        AGC reset interval, external FEM gain, and the radio chip's boosted RX gain.
 
         GET  /api/radio_frontend -> capabilities, running and configured values
         POST /api/radio_frontend {"agc_reset_interval_seconds": 0-1020,
-                                  "fem_rx_gain": bool, "fem_tx_gain": bool}
+                                  "fem_rx_gain": bool, "fem_tx_gain": bool,
+                                  "rx_boosted_gain": bool}
 
         POST applies to the modem first and persists only what it confirms; no
         restart is needed.
@@ -2150,7 +2153,7 @@ class APIEndpoints:
                 if isinstance(agc, bool) or not isinstance(agc, int) or not 0 <= agc <= 1020:
                     return self._error("agc_reset_interval_seconds must be an integer 0-1020")
                 updates["agc_reset_interval_seconds"] = agc
-            for key in ("fem_rx_gain", "fem_tx_gain"):
+            for key in ("fem_rx_gain", "fem_tx_gain", "rx_boosted_gain"):
                 if key in data:
                     if not isinstance(data[key], bool):
                         return self._error(f"{key} must be true or false")
