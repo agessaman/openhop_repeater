@@ -1,8 +1,12 @@
 import concurrent.futures
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+import openhop_core
+
+from repeater import __version__ as repeater_version
 from repeater.config import KISS_AGC_RESET_MAX_SEC
 
 logger = logging.getLogger(__name__)
@@ -19,6 +23,7 @@ class MeshCLI:
         send_advert_callback: Optional[Callable] = None,
         identity=None,
         storage_handler=None,
+        acl=None,
     ):
 
         self.config_path = Path(config_path)
@@ -29,6 +34,8 @@ class MeshCLI:
         self.send_advert_callback = send_advert_callback
         self.identity = identity
         self.storage_handler = storage_handler
+        # This identity's ACL, for setperm and get acl.
+        self.acl = acl
 
         # Store event loop reference for thread-safe scheduling
         import asyncio
@@ -162,7 +169,15 @@ class MeshCLI:
 
         return enriched
 
-    def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
+    def handle_command(
+        self, sender_pubkey: bytes, command: str, is_admin: bool, local: bool = False
+    ) -> str:
+        """Run one CLI command and return the reply.
+
+        ``local`` marks the operator's own console (the web CLI), our stand-in
+        for firmware's serial port, where ``sender_timestamp`` is 0. Commands
+        firmware accepts only on serial, such as ``get acl``, need it.
+        """
 
         # Check admin permission first
         if not is_admin:
@@ -182,14 +197,14 @@ class MeshCLI:
         logger.debug(f"After strip: '{command}'")
 
         # Route to appropriate handler
-        reply = self._route_command(command)
+        reply = self._route_command(command, local=local)
 
         # Add prefix back to reply if present
         if prefix:
             return prefix + reply
         return reply
 
-    def _route_command(self, command: str) -> str:
+    def _route_command(self, command: str, local: bool = False) -> str:
 
         # Help
         if command == "help" or command.startswith("help "):
@@ -217,6 +232,15 @@ class MeshCLI:
         elif command == "ver":
             return self._cmd_version()
 
+        # ACL commands. Firmware handles these before the common CLI, and
+        # "get acl" must be matched before the generic "get " below.
+        elif command.startswith("setperm "):
+            return self._cmd_setperm(command)
+        elif command == "get acl":
+            if not local:
+                return "Error: Use 'get acl' via serial console only"
+            return self._cmd_get_acl()
+
         # Get commands
         elif command.startswith("get "):
             return self._cmd_get(command[4:])
@@ -224,12 +248,6 @@ class MeshCLI:
         # Set commands
         elif command.startswith("set "):
             return self._cmd_set(command[4:])
-
-        # ACL commands
-        elif command.startswith("setperm "):
-            return self._cmd_setperm(command)
-        elif command == "get acl":
-            return "Error: Use 'get acl' via serial console only"
 
         # Region commands (repeaters only)
         elif command.startswith("region"):
@@ -241,7 +259,7 @@ class MeshCLI:
         # Neighbor commands
         elif command == "neighbors":
             return self._cmd_neighbors()
-        elif command.startswith("neighbor.remove "):
+        elif command == "neighbor.remove" or command.startswith("neighbor.remove "):
             return self._cmd_neighbor_remove(command)
         elif command.startswith("discover.scopes"):
             return self._cmd_discover_scopes(command)
@@ -325,7 +343,8 @@ class MeshCLI:
             "",
             "Other:",
             "  neighbors           List neighbors",
-            "  neighbor.remove <key>  Remove neighbor by pubkey",
+            "  neighbor.remove <key>  Remove neighbors by pubkey (prefix)",
+            "  neighbor.remove all    Remove all neighbors",
             "  discover.neighbors  Send zero-hop neighbor discovery",
             "  discover.scopes     Discover neighbor scopes, publish to MQTT",
             "  tempradio <freq> <bw> <sf> <cr> <timeout_mins>",
@@ -391,7 +410,16 @@ class MeshCLI:
                 "  region scopes, then publish the table to the MQTT neighbors topic.\n"
                 "  Requires a broker configured with neighbors: true."
             ),
-            "setperm": "setperm <pubkey_hex> <permission_int> \u2014 Set ACL permissions for a node.",
+            "setperm": (
+                "setperm <pubkey_hex> <perm> \u2014 Set a node's ACL entry, kept across restarts.\n"
+                "  perm: 1 read-only, 2 read-write, 3 admin (full 64-hex key)\n"
+                "  perm 0 removes the entry (a key prefix is enough)\n"
+                "  A key with an entry logs in with a blank password."
+            ),
+            "get acl": (
+                "get acl \u2014 List ACL entries as '<perm-hex> <pubkey>'.\n"
+                "  Local console only, as firmware's serial port."
+            ),
             "log": "log start|stop|erase \u2014 Control logging.",
         }
         return details.get(topic, f"No detailed help for '{topic}'. Type 'help' for command list.")
@@ -499,10 +527,15 @@ class MeshCLI:
         return "Error: Not yet implemented"
 
     def _cmd_version(self) -> str:
-        """Get version information."""
+        """Report the installed openHop repeater and core versions.
+
+        Nothing sets ``config["version"]``, so reading it answered the stale
+        fallback "v13" in every real deployment.
+        """
         role = "room_server" if self.identity_type == "room_server" else "repeater"
-        version = self.config.get("version", "13")
-        return f"openHop_{role} v{version}"
+        # A core without __version__ must not stop this module importing.
+        core_version = getattr(openhop_core, "__version__", "unknown")
+        return f"openHop_{role} v{repeater_version} (core v{core_version})"
 
     # ==================== Get Commands ====================
 
@@ -905,22 +938,54 @@ class MeshCLI:
 
     # ==================== ACL Commands ====================
 
+    @staticmethod
+    def _atoi(text: str) -> int:
+        """C ``atoi``: leading whitespace, optional sign, digits; anything else is 0."""
+        match = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text)
+        return int(match.group(1)) if match else 0
+
     def _cmd_setperm(self, command: str) -> str:
-        """Set permissions for a public key."""
-        # Format: setperm {pubkey-hex} {permissions-int}
-        parts = command[8:].split()
-        if len(parts) < 2:
+        """``setperm {pubkey-hex} {permissions}``, as firmware's repeater and room server.
+
+        The permissions go through ``atoi`` into a byte, so a non-numeric value
+        is 0, the guest role, which deletes the entry. A guest role takes a key
+        prefix; any other role needs the full 64-hex key.
+        """
+        args = command[len("setperm ") :]
+        sep = args.find(" ")
+        if sep < 0:
             return "Err - bad params"
-
-        pubkey_hex = parts[0]
+        pubkey_hex = args[:sep]
+        # Firmware reads at most a full key's worth of hex, and the whole
+        # string must then be that length and even.
+        hex_len = min(len(pubkey_hex), 64)
+        if len(pubkey_hex) != (hex_len // 2) * 2:
+            return "Err - bad pubkey"
         try:
-            permissions = int(parts[1])
+            pubkey = bytes.fromhex(pubkey_hex)
         except ValueError:
-            return "Err - invalid permissions"
+            return "Err - bad pubkey"
+        permissions = self._atoi(args[sep + 1 :]) & 0xFF
 
-        # TODO: Apply permissions via ACL
-        logger.info(f"setperm command: {pubkey_hex} -> {permissions}")
-        return "Error: Not yet implemented - use config file"
+        if self.acl is None:
+            logger.error("setperm: no ACL is attached to this CLI")
+            return "Err - invalid params"
+        from .acl import ACLStoreError
+
+        try:
+            applied = self.acl.apply_permissions(pubkey, permissions)
+        except ACLStoreError:
+            # Firmware saves lazily and cannot report this; we write before
+            # replying, so a grant that would vanish on restart is not "OK".
+            return "Err - failed to save"
+        return "OK" if applied else "Err - invalid params"
+
+    def _cmd_get_acl(self) -> str:
+        """``get acl``: the header, then ``"%02X <pubkey>"`` for each entry with permissions."""
+        lines = ["ACL:"]
+        if self.acl is not None:
+            lines.extend(self.acl.format_acl_lines())
+        return "\n".join(lines)
 
     # ==================== Region Commands ====================
 
@@ -1258,6 +1323,15 @@ class MeshCLI:
 
     # ==================== Neighbor Commands ====================
 
+    @staticmethod
+    def _zero_hop_repeaters(neighbors: dict) -> dict:
+        """The nodes MeshCore keeps as neighbours: repeaters heard zero-hop."""
+        return {
+            pubkey: info
+            for pubkey, info in neighbors.items()
+            if info.get("is_repeater", False) and info.get("zero_hop", False)
+        }
+
     def _cmd_neighbors(self) -> str:
         """List neighbors."""
         if not self.storage_handler:
@@ -1270,11 +1344,7 @@ class MeshCLI:
                 return "No neighbors discovered yet"
 
             # Match MeshCore behavior: show only zero-hop repeaters.
-            filtered_neighbors = {
-                pubkey: info
-                for pubkey, info in neighbors.items()
-                if info.get("is_repeater", False) and info.get("zero_hop", False)
-            }
+            filtered_neighbors = self._zero_hop_repeaters(neighbors)
 
             if not filtered_neighbors:
                 return "No zero hop repeaters discovered yet"
@@ -1304,30 +1374,40 @@ class MeshCLI:
             return f"Error: {e}"
 
     def _cmd_neighbor_remove(self, command: str) -> str:
-        """Remove a neighbor."""
-        raw_suffix = command[16:]
-        pubkey_hex = raw_suffix.strip()
+        """Remove neighbors whose public key starts with the given hex, or all.
 
-        # Keep MeshCore parity: plain empty is invalid, whitespace-only means remove all.
-        if raw_suffix == "":
-            return "ERR: Missing pubkey"
+        Firmware (CommonCLI.cpp ``neighbor.remove``) takes a hex pubkey prefix of
+        whole bytes, at most 32, and answers "ERR: bad pubkey" for an odd-length
+        or longer key. It also clears every neighbour when the key is empty,
+        which a stray trailing space can trigger; here clearing them all takes
+        an explicit ``neighbor.remove all`` and an empty key gets a hint.
+        """
+        # handle_command has already stripped the line, so a trailing space
+        # never reaches here: "neighbor.remove " arrives as "neighbor.remove".
+        pubkey_hex = command[len("neighbor.remove") :].strip()
+
+        if pubkey_hex == "":
+            return "ERR: Missing pubkey. Do you mean `neighbor.remove all`?"
 
         if not self.storage_handler:
             return "Error: Storage not available"
 
-        delete_fn = getattr(self.storage_handler, "delete_neighbors_by_pubkey_prefix", None)
+        delete_fn = getattr(self.storage_handler, "delete_neighbors", None)
         if not callable(delete_fn):
             return "Error: neighbor.remove not supported by storage backend"
 
+        if pubkey_hex != "all" and (
+            len(pubkey_hex) % 2 != 0
+            or len(pubkey_hex) > 64
+            or any(ch not in "0123456789abcdefABCDEF" for ch in pubkey_hex)
+        ):
+            return "ERR: bad pubkey"
+
         try:
-            if pubkey_hex == "":
-                delete_fn(None)
-                return "OK"
-
-            if any(ch not in "0123456789abcdefABCDEF" for ch in pubkey_hex):
-                return "ERR: bad pubkey"
-
-            delete_fn(pubkey_hex)
+            # Only what `neighbors` lists (firmware removes from its neighbour
+            # table), not every advert: companions, rooms and multi-hop nodes
+            # stay, whatever the key matches.
+            delete_fn(None if pubkey_hex == "all" else pubkey_hex)
             return "OK"
         except Exception as e:
             logger.error(f"neighbor.remove failed: {e}", exc_info=True)

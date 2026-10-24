@@ -88,7 +88,7 @@ def test_acl_blank_password_guest_rules_and_room_server_password_requirements():
     assert full_ok is False
     assert full_perms == 0
 
-    acl_ro_disabled = ACL(allow_read_only=False)
+    acl_ro_disabled = ACL(guest_password="guest", allow_read_only=False)
     ok2, perms2 = acl_ro_disabled.authenticate_client(
         client_identity=identity,
         shared_secret=b"secret",
@@ -109,6 +109,52 @@ def test_acl_blank_password_guest_rules_and_room_server_password_requirements():
     )
     assert ok3 is False
     assert perms3 == 0
+
+
+def test_an_empty_guest_password_admits_a_blank_password_as_guest():
+    """Firmware simple_repeater: blank matches the (default empty) guest password."""
+    acl = ACL(admin_password="admin", allow_read_only=False)
+    identity = _FakeIdentity(b"C" * 32)
+
+    ok, perms = acl.authenticate_client(
+        client_identity=identity, shared_secret=b"s", password="", timestamp=10
+    )
+    assert (ok, perms) == (True, PERM_ACL_GUEST)
+    assert acl.get_client(b"C" * 32).is_guest() is True
+
+    # Only a blank password matches an empty guest password.
+    wrong = acl.authenticate_client(
+        client_identity=_FakeIdentity(b"D" * 32),
+        shared_secret=b"s",
+        password="nope",
+        timestamp=10,
+    )
+    assert wrong == (False, 0)
+
+
+def test_a_known_admin_keeps_admin_on_a_blank_password_with_no_guest_password():
+    acl = ACL(admin_password="admin", allow_read_only=False)
+    identity = _FakeIdentity(b"E" * 32)
+    assert acl.authenticate_client(
+        client_identity=identity, shared_secret=b"s", password="admin", timestamp=10
+    ) == (True, PERM_ACL_ADMIN)
+    assert acl.authenticate_client(
+        client_identity=identity, shared_secret=b"s", password="", timestamp=11
+    ) == (True, PERM_ACL_ADMIN)
+
+
+def test_a_room_server_without_a_guest_password_still_refuses_a_blank_password():
+    acl = ACL(allow_read_only=False)
+    room_cfg = {"type": "room_server", "settings": {"admin_password": "roomadmin"}}
+    result = acl.authenticate_client(
+        client_identity=_FakeIdentity(b"F" * 32),
+        shared_secret=b"s",
+        password="",
+        timestamp=10,
+        target_identity_name="room-a",
+        target_identity_config=room_cfg,
+    )
+    assert result == (False, 0)
 
 
 def test_acl_admin_login_sets_client_state_and_replay_protection():
@@ -174,16 +220,18 @@ def test_acl_max_clients_invalid_password_and_remove_client_paths():
     assert ok_a is True
     assert acl.get_num_clients() == 1
 
-    full_ok, full_perms = acl.authenticate_client(id_b, b"s", "a", timestamp=2)
-    assert full_ok is False
-    assert full_perms == 0
+    # Full of admins: firmware putClient evicts the newest entry for B.
+    full_ok, _ = acl.authenticate_client(id_b, b"s", "a", timestamp=2)
+    assert full_ok is True
+    assert acl.get_num_clients() == 1
+    assert acl.get_client(b"C" * 32) is None
 
     bad_ok, bad_perms = acl.authenticate_client(id_a, b"s", "bad", timestamp=3)
     assert bad_ok is False
     assert bad_perms == 0
 
-    assert acl.remove_client(b"C" * 32) is True
-    assert acl.remove_client(b"C" * 32) is False
+    assert acl.remove_client(b"D" * 32) is True
+    assert acl.remove_client(b"D" * 32) is False
 
 
 @pytest.mark.asyncio

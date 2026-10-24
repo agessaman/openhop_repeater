@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urljoin, urlparse
 
 from .base import SensorBase
+from .modem_stats_discovery import ModemDiscovery
 from .registry import SensorRegistry
 
 
@@ -34,6 +35,79 @@ class OpenHopModemSensor(SensorBase):
 
     sensor_type = "openhop_modem"
 
+    _settings_schema = [
+        {
+            "key": "host",
+            "type": "string",
+            "label": "Host",
+            "default": "",
+            "help": "Modem hostname or IP address",
+        },
+        {
+            "key": "port",
+            "type": "integer",
+            "label": "Port",
+            "default": 80,
+            "help": "Modem HTTP API port (not the radio TCP port)",
+        },
+        {
+            "key": "scheme",
+            "type": "string",
+            "label": "Scheme",
+            "default": "http",
+            "help": "HTTP or HTTPS",
+        },
+        {
+            "key": "endpoint",
+            "type": "string",
+            "label": "Endpoint",
+            "default": "/api/stats",
+            "help": "Stats API path",
+        },
+        {
+            "key": "username",
+            "type": "string",
+            "label": "Username",
+            "default": "admin",
+            "help": "Basic auth username",
+        },
+        {
+            "key": "password",
+            "type": "string",
+            "label": "Password",
+            "default": "",
+            "help": "Basic auth password (not stored in API responses)",
+        },
+        {
+            "key": "poll_interval_seconds",
+            "type": "number",
+            "label": "Poll Interval (s)",
+            "default": 60.0,
+            "help": "How often to poll",
+        },
+        {
+            "key": "timeout_seconds",
+            "type": "number",
+            "label": "Timeout (s)",
+            "default": 2.0,
+            "help": "Request timeout",
+        },
+        {
+            "key": "discovery_include_paths",
+            "type": "string",
+            "label": "Additional metric paths",
+            "default": "",
+            "help": "Reviewed exact JSON Pointers, comma-separated",
+        },
+        {
+            "key": "discovery_exclude_paths",
+            "type": "string",
+            "label": "Excluded metric paths",
+            "default": "",
+            "help": "JSON Pointers, comma-separated; exclusions take precedence",
+        },
+    ]
+
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None, log=None):
         super().__init__(name=name, config=config, log=log)
         self.poll_interval_seconds = float(self.settings.get("poll_interval_seconds", 60.0))
@@ -42,6 +116,20 @@ class OpenHopModemSensor(SensorBase):
         self.url = self._build_url()
         self.username = str(self.settings.get("username", "admin") or "admin")
         self.password = self.settings.get("password")
+        try:
+            self.discovery = ModemDiscovery(
+                self.settings.get("discovery_include_paths", ""),
+                self.settings.get("discovery_exclude_paths", ""),
+            )
+        except (TypeError, ValueError):
+            # Legacy/hand-edited configuration must not disable the HTTP sensor.
+            # Invalid controls are ignored, reverting to the conservative policy.
+            self.log.warning("Invalid modem discovery policy; using default selection")
+            self.discovery = ModemDiscovery()
+        self._metrics: list[dict[str, Any]] = []
+
+    def _reading_metrics(self, ok: bool) -> list[dict[str, Any]]:
+        return self._metrics if ok else self.discovery.failed()
 
     def _build_url(self) -> str:
         base_url = self.settings.get("base_url")
@@ -81,23 +169,28 @@ class OpenHopModemSensor(SensorBase):
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
                 status = int(getattr(response, "status", 200) or 200)
-                body = response.read()
+                body = response.read(128 * 1024 + 1)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"openHop Modem HTTP {exc.code} reading {self.url}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"openHop Modem request failed: {exc.reason}") from exc
+            raise RuntimeError(f"openHop Modem HTTP {exc.code}") from None
+        except urllib.error.URLError:
+            raise RuntimeError("openHop Modem request failed") from None
 
         if status < 200 or status >= 300:
-            raise RuntimeError(f"openHop Modem HTTP {status} reading {self.url}")
+            raise RuntimeError(f"openHop Modem HTTP {status}")
+        if len(body) > 128 * 1024:
+            raise RuntimeError("openHop Modem response too large")
 
         try:
-            payload = json.loads(body.decode("utf-8"))
+            payload = json.loads(body.decode("utf-8"), parse_constant=lambda _value: None)
         except Exception as exc:
             raise RuntimeError("openHop Modem response was not valid JSON") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("openHop Modem response was not a JSON object")
 
-        return self._normalize_payload(payload)
+        data = self._normalize_payload(payload)
+        discovered, self._metrics = self.discovery.select(payload)
+        data.update(discovered)
+        return data
 
     def _normalize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         raw_gps = payload.get("gps")
@@ -127,7 +220,7 @@ class OpenHopModemSensor(SensorBase):
 
         out: Dict[str, Any] = {
             "source": "openhop_modem",
-            "url": self.url,
+            "url": self._safe_url(),
             "system_board": system.get("board"),
             "system_firmware": system.get("firmware"),
             "system_uptime": system.get("uptime"),
@@ -220,6 +313,19 @@ class OpenHopModemSensor(SensorBase):
                 out["battery_percent"] = _single_cell_voltage_to_percent(battery_voltage_v)
 
         return {key: value for key, value in out.items() if value is not None}
+
+    def _safe_url(self) -> str:
+        parsed = urlparse(self.url)
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        return parsed._replace(
+            netloc=host + (f":{parsed.port}" if parsed.port else ""),
+            path="",
+            params="",
+            query="",
+            fragment="",
+        ).geturl()
 
     def _battery_voltage_v(self, payload: Dict[str, Any]) -> Optional[float]:
         voltage_v = self._float(payload.get("battery_voltage_v"))

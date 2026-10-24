@@ -1,4 +1,5 @@
 import base64
+import copy
 import inspect
 import logging
 import os
@@ -9,7 +10,11 @@ from typing import Any, Dict, Optional, overload
 import yaml
 
 from repeater.exceptions import ConfigurationError
-from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
+from repeater.modem_config import (
+    LEGACY_MODEM_RADIO_TYPES,
+    normalize_modem_config,
+    redact_modem_tokens_in_place,
+)
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
@@ -138,6 +143,52 @@ class BaselineCrcCounterRadio:
             return int(getattr(self._radio, "crc_error_count", 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+
+def disconnected_modems(config: dict, radio) -> list[str]:
+    """Return configured USB/TCP modem labels whose live transport is down.
+
+    Core's TCP modem can begin in deferred-connect mode (begin() returns True),
+    so initialization status alone cannot report connectivity. Do not probe the
+    modem here: stats and WebSocket beats must stay cheap and non-invasive.
+    """
+    root = getattr(radio, "_radio", radio)
+    fabric = getattr(root, "fabric", None)
+    radios = getattr(fabric, "radios", None)
+    entries = config.get("radios")
+    if isinstance(entries, list) and entries:
+        configured = [
+            (str(e.get("id") or e.get("radio_id") or ""), e) for e in entries if isinstance(e, dict)
+        ]
+        physicals = radios if isinstance(radios, dict) else {}
+    else:
+        configured = [("", config)]
+        physicals = {
+            "": next(iter(radios.values())) if isinstance(radios, dict) and radios else root
+        }
+
+    down = []
+    for radio_id, entry in configured:
+        kind = entry.get("radio_type", config.get("radio_type"))
+        if kind == "pymc_tcp":
+            kind = "modem_tcp"
+        elif kind == "pymc_usb":
+            kind = "modem_usb"
+        if kind not in ("modem_tcp", "modem_usb"):
+            continue
+        device = physicals.get(radio_id, root if isinstance(root, NullRadio) else None)
+        device = getattr(device, "_radio", device)
+        if isinstance(device, NullRadio):
+            connected = False
+        elif kind == "modem_tcp":
+            sock = getattr(device, "_sock", ...)
+            connected = sock is not None if sock is not ... else None
+        else:
+            event = getattr(device, "_connected_event", None)
+            connected = event.is_set() if event is not None else None
+        if connected is False:
+            down.append(f"{radio_id}: {kind}" if radio_id else kind)
+    return down
 
 
 def resolve_storage_dir(
@@ -302,7 +353,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "Adding secure placeholders — complete setup wizard before login."
         )
         config["repeater"]["security"] = {
-            "max_clients": 1,
+            "max_clients": 32,  # firmware MAX_CLIENTS
             "admin_password": None,
             "guest_password": None,
             "allow_read_only": False,
@@ -487,6 +538,40 @@ def kiss_hardware_config(board_config: dict) -> Dict[str, Any]:
         if kiss_cfg.get(key) is not None:
             options[key] = bool(kiss_cfg[key])
     return options
+
+
+# MeshCore's private LoRa sync word, as the USB/TCP modem firmware expects it.
+MESHCORE_SYNC_WORD = 0x12
+
+
+def _checked_modem_sync_word(sync_word: int, board_config: dict, radio_type: str) -> int:
+    """The sync word to hand a USB/TCP modem, warning when it is not MeshCore's.
+
+    These are the drivers that actually push the value to the radio, and a
+    modem on another sync word connects, answers pings and transmits, yet hears
+    no MeshCore traffic -- a silent failure. A radios[] entry inherits the
+    top-level ``radio.sync_word``, which the SX1262 driver ignores (SX1262Radio
+    stores it but never calls setSyncWord), so a stray top-level value is
+    harmless until a modem entry picks it up.
+    """
+    if sync_word != MESHCORE_SYNC_WORD:
+        radio_id = board_config.get("_radio_label") or board_config.get("_radio_id")
+        if radio_id:
+            where = f"radios[{radio_id}].radio"
+            if board_config.get("_sync_word_inherited"):
+                where += " (it inherits the top-level radio.sync_word)"
+        else:
+            where = "its radio section"
+        logger.warning(
+            "%s sync_word is 0x%X, not MeshCore's 0x%02X: the modem will not hear "
+            "MeshCore traffic. Set sync_word: 0x%02X in %s.",
+            f"Radio {radio_id!r} ({radio_type})" if radio_id else f"{radio_type} radio",
+            sync_word,
+            MESHCORE_SYNC_WORD,
+            MESHCORE_SYNC_WORD,
+            where,
+        )
+    return sync_word
 
 
 def get_radio_for_board(board_config: dict):
@@ -737,7 +822,13 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(tcp_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(tcp_cfg.get("lbt_max_attempts", 5)),
@@ -779,14 +870,21 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(usb_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(usb_cfg.get("lbt_max_attempts", 5)),
         )
 
         try:
-            radio.begin()
+            if radio.begin() is False:
+                raise RuntimeError("USB modem did not connect or accept radio configuration")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize modem_usb radio: {e}") from e
 
@@ -798,11 +896,28 @@ def get_radio_for_board(board_config: dict):
     )
 
 
+# Keys within one section that are alternative spellings of a single setting.
+# Whole-section replacement kept these from meeting; key-by-key overlay lets an
+# inherited spelling sit next to the entry's, and downstream each pair has a
+# fixed winner -- en_pins beats en_pin in SX1262Radio, "address" beats
+# "device_address" and "serial_number" beats "serial" in get_radio_for_board.
+# So an entry naming one spelling drops the other rather than losing to a
+# default it never wrote, which would otherwise fail silently: a radio that
+# never powers up, or one opened on the wrong CH341 adapter.
+_RADIO_SECTION_ALIASES = {
+    "sx1262": (("en_pin", "en_pins"),),
+    "ch341": (("address", "device_address"), ("serial_number", "serial")),
+}
+
+
 def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
     """Build a board_config dict for one radios[] entry.
 
-    Entry may override radio_type and hardware sections; shared top-level
-    ``radio`` air settings are inherited unless the entry supplies its own.
+    Top-level radio and hardware sections act as defaults for multi-radio
+    entries. Mapping sections are overlaid key-by-key, so an entry only needs
+    to specify values that differ from the top-level configuration. Explicit
+    values, including False/None, override inherited values. ``radio_type``
+    is a scalar override.
     """
     if not isinstance(entry, dict):
         raise ValueError("each radios[] entry must be a mapping")
@@ -812,8 +927,15 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         raise ValueError("each radios[] entry requires an 'id'")
 
     merged = dict(global_config)
+
+    # radio_type is scalar: a per-radio value replaces the global value.
+    if "radio_type" in entry:
+        merged["radio_type"] = entry["radio_type"]
+
+    # Configuration sections use shallow overlay semantics. This is
+    # intentionally one level deep: the known sections currently contain
+    # scalar values and simple lists rather than nested configuration trees.
     for key in (
-        "radio_type",
         "radio",
         "sx1262",
         "ch341",
@@ -821,13 +943,30 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         "modem_tcp",
         "modem_usb",
     ):
-        if key in entry:
-            merged[key] = entry[key]
+        if key not in entry:
+            continue
+
+        base = global_config.get(key)
+        override = entry[key]
+
+        if isinstance(base, dict) and isinstance(override, dict):
+            inherited = dict(base)
+            for group in _RADIO_SECTION_ALIASES.get(key, ()):
+                if any(alias in override for alias in group):
+                    for alias in group:
+                        inherited.pop(alias, None)
+            merged[key] = {**inherited, **override}
+        else:
+            merged[key] = override
 
     if "radio_type" not in entry and "radio_type" not in global_config:
         raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
 
     merged["_radio_id"] = str(radio_id)
+    # build_radio_stack pops _radio_id; this survives it, to name the radio in logs.
+    merged["_radio_label"] = str(radio_id)
+    own_radio = entry.get("radio") if isinstance(entry.get("radio"), dict) else {}
+    merged["_sync_word_inherited"] = "sync_word" not in own_radio
     # Hint for CH341 path: do not install process-global SPI/GPIO defaults.
     merged["_ch341_per_instance"] = True
     return merged
@@ -1305,7 +1444,57 @@ def build_metering_profiles(config: dict) -> list:
     return profiles
 
 
-def build_radio_status_entries(config: dict) -> list:
+def _default_radio_id(config: dict, radio_ids: list) -> Optional[str]:
+    """The radio a live config save retunes, read from a config mapping.
+
+    Follows build_radio_stack's TX default -- ``fabric.default_radio``, else the
+    first configured radio -- with one deliberate difference: a default naming a
+    radio that is not in ``radio_ids`` falls back to the first instead of being
+    returned as-is. build_radio_stack hands an unknown id straight to FabricRadio
+    and the node fails to start, so that config never reaches a status publish;
+    here the fallback only has to avoid freezing every entry.
+
+    Callers reporting on a *running* node should capture this at boot rather
+    than recompute it: ``fabric.default_radio`` is restart-required, so a live
+    edit changes this answer while the running Fabric keeps its original
+    default. See ``capture_radio_status_baseline``.
+    """
+    fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
+    default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
+    if default_radio and str(default_radio) in radio_ids:
+        return str(default_radio)
+    return radio_ids[0] if radio_ids else None
+
+
+def capture_radio_status_baseline(config: dict) -> tuple:
+    """The radio map and default radio id as built, for a reporter to hold.
+
+    Call this once, from boot config, before anything can edit it. Returns
+    ``(applied, default_radio_id)`` to hand back to
+    ``build_radio_status_entries`` on every later build.
+
+    Both halves have to be captured together and early. The map is what
+    non-default radios keep until they are really reconfigured, and the default
+    id is which entry is allowed to move -- and that id is itself restart-required,
+    so reading it from live config would let a pending ``fabric.default_radio``
+    edit refresh the radio that was not retuned while freezing the one that was,
+    reporting both radios wrongly where rebuilding everything got one right.
+
+    Returns ``({}, None)`` if the config cannot be read, which leaves the caller
+    rebuilding from config exactly as it did before.
+    """
+    try:
+        entries = build_radio_status_entries(config)
+    except Exception as exc:  # pragma: no cover - reporting must not break startup
+        logger.debug("Could not capture the radio status baseline: %s", exc)
+        return {}, None
+    applied = {entry["id"]: entry for entry in entries}
+    return applied, _default_radio_id(config, list(applied))
+
+
+def build_radio_status_entries(
+    config: dict, *, applied: Optional[dict] = None, default_radio_id: Optional[str] = None
+) -> list:
     """Map every radio id to its air settings, for the MQTT status message.
 
     Observers join this against the ``rx_radio_id`` / ``tx_radio_ids`` fields
@@ -1321,12 +1510,27 @@ def build_radio_status_entries(config: dict) -> list:
     the air settings it never voids the map: power does not decide which band a
     packet was on, so an entry without it still attributes the packet correctly.
 
-    Every value here is what the node is **configured** with, not a reading from
-    the hardware. Two consequences worth knowing before trusting a figure: a
-    driver may clamp what it was given (an SX1262 holds -9..22 dBm), and editing
-    a ``radios[]`` entry does not reconfigure that radio live -- ``config_manager``
-    only applies the top-level ``radio`` section -- so after such an edit the map
-    leads the hardware until the service restarts.
+    These are the settings each radio was actually configured with, not a
+    reading from the hardware -- a driver may still clamp what it was given (an
+    SX1262 holds -9..22 dBm).
+
+    ``applied`` maps radio id to the entry built when that radio was last really
+    configured, and ``default_radio_id`` says which entry a live save is allowed
+    to move. Both come from ``capture_radio_status_baseline`` at boot; passing
+    ``applied`` without ``default_radio_id`` falls back to reading the default
+    from ``config``, which is only right if nothing has edited it yet. Only the
+    default radio is retuned without a restart: a change to any other sits in
+    ``radios[]`` marked restart-required. Because ``radios[]`` entries inherit the top-level
+    ``radio`` block key by key, a save that edits the default radio also moves
+    the *configured* values of every radio whose entry omits that key, so
+    rebuilding all of them from config would publish a bandwidth the hardware
+    was never given and mis-attribute that radio's packets to a band it is not
+    on. Entries other than the default therefore keep their applied values until
+    the service restarts. ``AirtimeBudgets._effective_air`` holds the same line
+    for duty-cycle metering.
+
+    Passing no ``applied`` map rebuilds every entry from config, which is what a
+    fresh start wants.
 
     Returns an empty list when any radio's settings are unreadable: a partial
     map would silently attribute a packet to the wrong band, which is worse
@@ -1352,7 +1556,37 @@ def build_radio_status_entries(config: dict) -> list:
         if tx_power is not None:
             entry["tx_power"] = tx_power
         entries.append(entry)
+
+    if applied:
+        default_id = default_radio_id
+        if default_id is None:
+            default_id = _default_radio_id(config, [entry["id"] for entry in entries])
+        entries = [
+            entry if entry["id"] == default_id else applied.get(entry["id"], entry)
+            for entry in entries
+        ]
     return entries
+
+
+_RADIO_LOG_SECTIONS = ("radio", "sx1262", "ch341", "kiss", "modem_tcp", "modem_usb")
+
+
+def _describe_radio_config(board_config: dict) -> str:
+    """Render a resolved board_config for debug logging, tokens redacted.
+
+    What a radio inherited is otherwise invisible: the config file shows the
+    entry, not the merge, and a wrong answer surfaces as a radio that does not
+    transmit. ``modem_tcp.token`` is the one credential these sections carry,
+    and ``redact_modem_tokens_in_place`` runs over a copy so the live config is
+    untouched.
+    """
+    snapshot = {
+        key: copy.deepcopy(board_config[key]) for key in _RADIO_LOG_SECTIONS if key in board_config
+    }
+    redact_modem_tokens_in_place(snapshot, replacement="***")
+    parts = [f"type={board_config.get('radio_type')!r}"]
+    parts.extend(f"{key}={snapshot[key]!r}" for key in _RADIO_LOG_SECTIONS if key in snapshot)
+    return " ".join(parts)
 
 
 def build_radio_stack(config: dict):
@@ -1403,6 +1637,8 @@ def build_radio_stack(config: dict):
         for entry in radios_cfg:
             merged = _merge_radio_entry(config, entry)
             rid = merged.pop("_radio_id")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Resolved radio %r: %s", rid, _describe_radio_config(merged))
             physical = get_radio_for_board(merged)
             pairs.append((physical, rid))
             profile = _radio_air_profile(merged, rid)
