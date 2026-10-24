@@ -828,12 +828,12 @@ paths:
   /radio_frontend:
     get:
       tags: [System]
-      summary: Get KISS modem RF front-end controls
+      summary: Get default-radio RF front-end controls
       description: >
         AGC reset interval, external FEM gain and radio chip boosted RX gain of the
-        default radio, read from the
-        modem. Only KISS modems running MeshCore KISS firmware v2 or later report
-        support; the controls a board supports come from the board itself.
+        default radio, read from the modem. KISS firmware v2 and OpenHop modem
+        firmware that implements the RF frame commands report support; the controls
+        a board supports come from the board itself.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -852,7 +852,7 @@ paths:
                     $ref: '#/components/schemas/RadioFrontendStatus'
     post:
       tags: [System]
-      summary: Set KISS modem RF front-end controls
+      summary: Set default-radio RF front-end controls
       description: >
         Applies the given settings to the default radio's modem and persists only the
         values it confirms. Takes effect immediately; no restart is needed. Omitted
@@ -6019,8 +6019,11 @@ components:
         agc_reset_interval_seconds:
           type: integer
           minimum: 0
-          maximum: 1020
-          description: Periodic AGC reset in seconds, 4 s resolution (rounded down), 0 = off
+          maximum: 3600
+          description: >
+            Periodic AGC reset in seconds, 0 = off. KISS firmware accepts 0-1020
+            and rounds down to a multiple of 4. An OpenHop modem accepts 0-3600
+            in 1-second steps. The stored value is what the radio confirmed.
         fem_rx_gain:
           type: boolean
           description: External FEM RX (LNA) gain
@@ -6039,7 +6042,7 @@ components:
       properties:
         available:
           type: boolean
-          description: Default radio is a KISS modem with front-end controls
+          description: Default radio is a KISS or OpenHop modem with front-end controls
         supports:
           type: object
           required: [agc_reset_interval_seconds, fem_rx_gain, fem_tx_gain, rx_boosted_gain]

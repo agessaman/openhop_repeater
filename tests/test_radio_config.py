@@ -325,12 +325,57 @@ def test_kiss_hardware_config_legacy_agc_fallback_and_bounds():
     assert kiss_hardware_config({"repeater": {"agc_reset_interval": 8}}) == {
         "agc_reset_interval_seconds": 8
     }
+    # Above the KISS limit is passed through; the radio enforces its own range.
     assert kiss_hardware_config({"kiss": {"agc_reset_interval_seconds": 9999}}) == {
-        "agc_reset_interval_seconds": 1020
+        "agc_reset_interval_seconds": 9999
     }
     # A bad value is dropped rather than stopping the radio from being built.
     assert kiss_hardware_config({"kiss": {"agc_reset_interval_seconds": "soon"}}) == {}
+    assert kiss_hardware_config({"kiss": {"agc_reset_interval_seconds": True}}) == {}
+    assert kiss_hardware_config({"kiss": {"agc_reset_interval_seconds": -1}}) == {}
     assert kiss_hardware_config({"kiss": {"port": "/dev/x"}}) == {}
+
+
+def test_radio_frontend_config_reads_the_modem_section_not_kiss():
+    from repeater.config import radio_frontend_config
+
+    modem = {
+        "agc_reset_interval_seconds": 30,
+        "fem_tx_gain": True,
+        "rx_boosted_gain": False,
+    }
+    kiss = {"agc_reset_interval_seconds": 8, "fem_rx_gain": True}
+    assert radio_frontend_config(
+        {"radio_type": "modem_tcp", "modem_tcp": {"host": "m", **modem}, "kiss": kiss}
+    ) == modem
+    assert radio_frontend_config(
+        {"radio_type": "modem_usb", "modem_usb": {"port": "/dev/ttyACM0", **modem}, "kiss": kiss}
+    ) == modem
+    # Legacy repeater key fills in only when the radio's own section has no AGC key.
+    assert radio_frontend_config(
+        {
+            "radio_type": "modem_usb",
+            "modem_usb": {"port": "/dev/ttyACM0"},
+            "kiss": kiss,
+            "repeater": {"agc_reset_interval": 30},
+        }
+    ) == {"agc_reset_interval_seconds": 30}
+
+
+@pytest.mark.parametrize("radio_type", ["modem_tcp", "modem_usb"])
+def test_modem_constructor_receives_its_frontend_config(monkeypatch, radio_type):
+    captured = _capture_modem(monkeypatch, radio_type)
+    board = _modem_board(radio_type, _modem_radio_cfg())
+    board[radio_type]["agc_reset_interval_seconds"] = 2000
+    board[radio_type]["fem_rx_gain"] = True
+    board["kiss"] = {"agc_reset_interval_seconds": 8, "fem_tx_gain": True}
+
+    get_radio_for_board(board)
+
+    assert captured["radio_config"] == {
+        "agc_reset_interval_seconds": 2000,
+        "fem_rx_gain": True,
+    }
 
 
 # ─── sync word warning for USB/TCP modems ──────────────────────────────

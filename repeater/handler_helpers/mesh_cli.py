@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, Optional
 import openhop_core
 
 from repeater import __version__ as repeater_version
-from repeater.config import KISS_AGC_RESET_MAX_SEC
+from repeater.config import AGC_RESET_INTERVAL_MAX_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -333,10 +333,10 @@ class MeshCLI:
             "  get direct.txdelay  Direct TX delay factor",
             "  get multi.acks      Multi-ack count",
             "  get int.thresh      Interference threshold",
-            "  get agc.reset.interval  AGC reset interval (KISS modem)",
-            "  get radio.fem.rxgain  External FEM RX gain (KISS modem)",
-            "  get radio.fem.txgain  External FEM TX gain (KISS modem)",
-            "  get radio.rxgain    Radio chip boosted RX gain (KISS modem)",
+            "  get agc.reset.interval  AGC reset interval (default radio)",
+            "  get radio.fem.rxgain  External FEM RX gain (default radio)",
+            "  get radio.fem.txgain  External FEM TX gain (default radio)",
+            "  get radio.rxgain    Radio chip boosted RX gain (default radio)",
             "",
             "Set:  (use 'help set' for details)",
             "  set <param> <value>",
@@ -383,10 +383,10 @@ class MeshCLI:
                 "  set direct.txdelay <val>  Direct TX delay (0-2)\n"
                 "  set multi.acks <n>     Multi-ack count\n"
                 "  set int.thresh <dbm>   Interference threshold\n"
-                "  set agc.reset.interval <n>  AGC reset secs (x4, 0=off; KISS modem)\n"
-                "  set radio.fem.rxgain on|off  External FEM RX gain (KISS modem)\n"
-                "  set radio.fem.txgain on|off  External FEM TX gain (KISS modem)\n"
-                "  set radio.rxgain on|off  Radio chip boosted RX gain (KISS modem)"
+                "  set agc.reset.interval <n>  AGC reset secs (0-3600, 0=off; default radio)\n"
+                "  set radio.fem.rxgain on|off  External FEM RX gain (default radio)\n"
+                "  set radio.fem.txgain on|off  External FEM TX gain (default radio)\n"
+                "  set radio.rxgain on|off  Radio chip boosted RX gain (default radio)"
             ),
             "get": "Get commands \u2014 type 'help' to see all 'get' parameters.",
             "reboot": "Restart the repeater service via systemd.",
@@ -880,19 +880,25 @@ class MeshCLI:
                 return "OK"
 
             elif key == "agc.reset.interval":
-                # Clamp like firmware; the modem rounds down to a multiple of 4.
-                interval = max(0, min(KISS_AGC_RESET_MAX_SEC, int(value)))
+                interval = int(value)
+                if interval < 0 or interval > AGC_RESET_INTERVAL_MAX_SEC:
+                    return f"Error: must be 0-{AGC_RESET_INTERVAL_MAX_SEC}"
                 radio = self._kiss_radio("supports_agc_reset_control")
                 if radio is None:
                     return "Error: unsupported"
-                effective = radio.set_agc_reset_interval(interval)
+                try:
+                    effective = radio.set_agc_reset_interval(interval)
+                except ValueError:
+                    return "Error: radio did not apply setting"
                 if effective is None:
                     return "Error: radio did not apply setting"
                 if not self.config_manager.persist_default_kiss_settings(
                     {"agc_reset_interval_seconds": effective}
                 ):
                     return "Error: applied to radio but failed to save config"
-                return f"OK - interval rounded to {effective}"
+                if effective != interval:
+                    return f"OK - interval now {effective}"
+                return "OK"
 
             elif key in self._FEM_KEYS:
                 if value not in ("on", "off"):

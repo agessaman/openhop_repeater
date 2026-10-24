@@ -149,6 +149,82 @@ def test_apply_save_failure_rolls_back():
     assert config["kiss"] == {"port": "/dev/ttyACM0"}
 
 
+def test_apply_persists_into_the_modem_section_without_copying_kiss():
+    radio = FakeKissRadio()
+
+    def keep(seconds):
+        radio.agc = seconds
+        return seconds
+
+    radio.set_agc_reset_interval = keep
+    config = {
+        "radio_type": "modem_tcp",
+        "modem_tcp": {"host": "modem.local"},
+        "kiss": {"agc_reset_interval_seconds": 8, "fem_rx_gain": True},
+        "repeater": {"agc_reset_interval": 60},
+    }
+    mgr, config = _manager(radio, config)
+
+    result = mgr.apply_kiss_frontend({"agc_reset_interval_seconds": 30, "fem_tx_gain": True})
+
+    assert result["applied"] == {"agc_reset_interval_seconds": 30, "fem_tx_gain": True}
+    assert config["modem_tcp"]["agc_reset_interval_seconds"] == 30
+    assert config["modem_tcp"]["fem_tx_gain"] is True
+    assert config["kiss"] == {"agc_reset_interval_seconds": 8, "fem_rx_gain": True}
+    assert "agc_reset_interval" not in config["repeater"]
+
+
+def test_apply_offers_an_interval_above_1020():
+    radio = FakeKissRadio()
+    seen = {}
+
+    def keep(seconds):
+        seen["agc"] = seconds
+        radio.agc = seconds
+        return seconds
+
+    radio.set_agc_reset_interval = keep
+    mgr, config = _manager(radio)
+
+    result = mgr.apply_kiss_frontend({"agc_reset_interval_seconds": 2000})
+
+    assert seen["agc"] == 2000
+    assert result["applied"] == {"agc_reset_interval_seconds": 2000}
+    assert config["kiss"]["agc_reset_interval_seconds"] == 2000
+
+
+def test_apply_maps_a_radio_range_error_to_not_applied():
+    radio = FakeKissRadio()
+
+    def reject(_seconds):
+        raise ValueError("0-1020")
+
+    radio.set_agc_reset_interval = reject
+    mgr, config = _manager(radio)
+
+    result = mgr.apply_kiss_frontend({"agc_reset_interval_seconds": 2000})
+
+    assert result == {
+        "applied": {},
+        "errors": {"agc_reset_interval_seconds": "radio did not apply setting"},
+    }
+    assert "agc_reset_interval_seconds" not in config["kiss"]
+    mgr.save_to_file.assert_not_called()
+
+
+def test_status_configured_comes_from_the_modem_section():
+    radio = FakeKissRadio()
+    mgr, _ = _manager(
+        radio,
+        {
+            "radio_type": "modem_usb",
+            "modem_usb": {"port": "/dev/ttyACM0", "agc_reset_interval_seconds": 30},
+            "kiss": {"agc_reset_interval_seconds": 8},
+        },
+    )
+    assert mgr.kiss_frontend_status()["configured"] == {"agc_reset_interval_seconds": 30}
+
+
 def test_apply_on_non_kiss_radio_is_unsupported():
     mgr, config = _manager(None)
     result = mgr.apply_kiss_frontend({"agc_reset_interval_seconds": 4})
@@ -197,6 +273,26 @@ def test_endpoint_post_applies_without_restart(request_ctx):
     assert radio.agc == 4
 
 
+def test_endpoint_post_offers_intervals_above_1020(request_ctx):
+    radio = FakeKissRadio()
+
+    def keep(seconds):
+        radio.agc = seconds
+        return seconds
+
+    radio.set_agc_reset_interval = keep
+    api = _api(radio, {"radio_type": "modem_tcp", "modem_tcp": {"host": "modem.local"}})
+    request_ctx.method = "POST"
+    request_ctx.json = {"agc_reset_interval_seconds": 2000}
+
+    result = api.radio_frontend()
+
+    assert result["success"] is True
+    assert radio.agc == 2000
+    assert api.config["modem_tcp"]["agc_reset_interval_seconds"] == 2000
+    assert "kiss" not in api.config
+
+
 def test_endpoint_post_partial_failure_still_returns_status(request_ctx):
     api = _api(FakeKissRadio(caps=("agc",)))
     request_ctx.method = "POST"
@@ -213,10 +309,10 @@ def test_endpoint_post_partial_failure_still_returns_status(request_ctx):
 @pytest.mark.parametrize(
     "body, message",
     [
-        ({"agc_reset_interval_seconds": 1021}, "0-1020"),
-        ({"agc_reset_interval_seconds": -1}, "0-1020"),
-        ({"agc_reset_interval_seconds": "4"}, "0-1020"),
-        ({"agc_reset_interval_seconds": True}, "0-1020"),
+        ({"agc_reset_interval_seconds": 3601}, "0-3600"),
+        ({"agc_reset_interval_seconds": -1}, "0-3600"),
+        ({"agc_reset_interval_seconds": "4"}, "0-3600"),
+        ({"agc_reset_interval_seconds": True}, "0-3600"),
         ({"fem_rx_gain": "on"}, "true or false"),
         ({"rx_boosted_gain": 1}, "true or false"),
         ({}, "No valid settings"),

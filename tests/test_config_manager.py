@@ -285,11 +285,22 @@ def test_non_default_radio_change_requires_restart_and_keeps_runtime_metering():
 class _DummyKissHwRadio:
     """KissModemWrapper AGC/FEM surface; records commands sent to the modem."""
 
-    def __init__(self, caps=("agc", "rx", "tx"), applied=None, fem_sticks=True):
+    def __init__(
+        self, caps=("agc", "rx", "tx"), applied=None, fem_sticks=True, agc_step=4, agc_max=1020
+    ):
         self.caps = set(caps)
         self.applied_hardware_config = dict(applied or {})
         self.fem_sticks = fem_sticks  # False: modem reports a state other than requested
+        self.agc_step = agc_step
+        self.agc_max = agc_max
         self.calls = []
+
+    def effective_agc_reset_interval(self, seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int):
+            return None
+        if not 0 <= seconds <= self.agc_max:
+            return None
+        return seconds - seconds % self.agc_step
 
     def supports_agc_reset_control(self):
         return "agc" in self.caps
@@ -302,7 +313,9 @@ class _DummyKissHwRadio:
 
     def set_agc_reset_interval(self, seconds):
         self.calls.append(("agc", seconds))
-        effective = seconds - seconds % 4
+        effective = self.effective_agc_reset_interval(seconds)
+        if effective is None:
+            raise ValueError("out of range")
         self.applied_hardware_config["agc_reset_interval_seconds"] = effective
         return effective
 
@@ -357,6 +370,76 @@ def test_live_kiss_update_reports_unsupported_settings():
 
     assert manager.live_update_daemon(["kiss"]) is False
     assert radio.calls == [("fem", True, None)]
+
+
+def test_live_modem_agc_is_not_rounded_to_four_seconds():
+    config = {
+        "radio_type": "modem_tcp",
+        "modem_tcp": {"host": "modem.local", "agc_reset_interval_seconds": 30},
+        "kiss": {"agc_reset_interval_seconds": 8},
+    }
+    # 28 is what a KISS radio would have stored for 30. It must not count as applied.
+    radio = _DummyKissHwRadio(
+        agc_step=1, agc_max=3600, applied={"agc_reset_interval_seconds": 28}
+    )
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["modem_tcp"])
+    assert radio.calls == [("agc", 30)]
+    assert radio.applied_hardware_config["agc_reset_interval_seconds"] == 30
+
+
+def test_live_modem_agc_already_running_is_not_resent():
+    config = {
+        "radio_type": "modem_usb",
+        "modem_usb": {"port": "/dev/ttyACM0", "agc_reset_interval_seconds": 30},
+    }
+    radio = _DummyKissHwRadio(
+        agc_step=1, agc_max=3600, applied={"agc_reset_interval_seconds": 30}
+    )
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["modem_usb"])
+    assert radio.calls == []
+
+
+def test_live_modem_is_offered_an_interval_above_the_kiss_limit():
+    config = {
+        "radio_type": "modem_tcp",
+        "modem_tcp": {"host": "modem.local", "agc_reset_interval_seconds": 2000},
+    }
+    radio = _DummyKissHwRadio(agc_step=1, agc_max=3600)
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["modem_tcp"])
+    assert radio.calls == [("agc", 2000)]
+
+
+def test_live_kiss_interval_above_its_range_is_not_clamped_and_sent():
+    config = {"kiss": {"port": "/dev/ttyACM0", "agc_reset_interval_seconds": 2000}}
+    radio = _DummyKissHwRadio()
+    manager, _ = _kiss_manager(config, radio)
+
+    assert manager.live_update_daemon(["kiss"]) is False
+    assert radio.calls == []
+
+
+def test_default_frontend_section_writes_the_default_modem():
+    config = {
+        "modem_tcp": {"host": "shared"},
+        "radios": [
+            {"id": "a", "radio_type": "modem_tcp"},
+            {"id": "b", "radio_type": "modem_usb", "modem_usb": {"port": "/dev/ttyACM0"}},
+        ],
+        "fabric": {"default_radio": "b"},
+    }
+    manager = ConfigManager("/tmp/config.yaml", config, None)
+
+    manager.default_frontend_section()["agc_reset_interval_seconds"] = 30
+
+    assert config["radios"][1]["modem_usb"]["agc_reset_interval_seconds"] == 30
+    assert "agc_reset_interval_seconds" not in config["modem_tcp"]
+    assert "modem_tcp" not in config["radios"][0]
 
 
 def test_live_kiss_update_ignores_legacy_key_on_non_kiss_radio():

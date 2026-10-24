@@ -795,7 +795,7 @@ def test_agc_get_reads_the_running_modem_not_config():
 def test_agc_set_applies_then_persists_effective_value():
     radio = FakeKissRadio()
     cli, cfg, mgr = _kiss_cli(radio)
-    assert cli._cmd_set("agc.reset.interval 10") == "OK - interval rounded to 8"
+    assert cli._cmd_set("agc.reset.interval 10") == "OK - interval now 8"
     assert radio.agc == 8
     assert cfg["kiss"]["agc_reset_interval_seconds"] == 8
     assert "agc_reset_interval" not in cfg["repeater"]  # legacy key migrated
@@ -803,11 +803,41 @@ def test_agc_set_applies_then_persists_effective_value():
     mgr.live_update_daemon.assert_not_called()  # already applied to hardware
 
 
-def test_agc_set_clamps_like_firmware():
+def test_agc_set_rejects_out_of_range_and_keeps_an_unchanged_zero():
     radio = FakeKissRadio()
-    cli, cfg, _ = _kiss_cli(radio)
-    assert cli._cmd_set("agc.reset.interval 5000") == "OK - interval rounded to 1020"
-    assert cli._cmd_set("agc.reset.interval 0") == "OK - interval rounded to 0"
+    cli, cfg, mgr = _kiss_cli(radio)
+    assert cli._cmd_set("agc.reset.interval 5000") == "Error: must be 0-3600"
+    assert cli._cmd_set("agc.reset.interval 0") == "OK"
+    assert radio.agc == 0
+    assert cfg["kiss"]["agc_reset_interval_seconds"] == 0
+    mgr.save_to_file.assert_called_once()
+
+
+def test_agc_set_on_modem_persists_the_unrounded_value_in_its_section():
+    radio = FakeKissRadio()
+
+    def keep(seconds):
+        if seconds > 1020:
+            raise ValueError("kiss range")
+        radio.agc = seconds
+        return seconds
+
+    radio.set_agc_reset_interval = keep
+    cfg = _base_config()
+    cfg["radio_type"] = "modem_tcp"
+    cfg["modem_tcp"] = {"host": "modem.local"}
+    cfg["kiss"] = {"agc_reset_interval_seconds": 8}
+    cli, cfg, mgr = _kiss_cli(radio, cfg=cfg)
+
+    assert cli._cmd_set("agc.reset.interval 30") == "OK"
+    assert radio.agc == 30
+    assert cfg["modem_tcp"]["agc_reset_interval_seconds"] == 30
+    assert cfg["kiss"] == {"agc_reset_interval_seconds": 8}
+    assert "agc_reset_interval" not in cfg["repeater"]
+
+    assert cli._cmd_set("agc.reset.interval 2000") == "Error: radio did not apply setting"
+    assert cfg["modem_tcp"]["agc_reset_interval_seconds"] == 30
+    mgr.save_to_file.assert_called_once()
 
 
 def test_agc_set_failure_persists_nothing():
